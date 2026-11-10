@@ -339,3 +339,22 @@ of the normal text weight. If keyword retrieval is unavailable, a working vector
 score. A healthy arm with no matches keeps the configured hybrid weights. Degraded searches
 are recorded in logs. Changing score normalization can change `minScore` decisions; validate
 custom thresholds against representative queries.
+
+## Experimental benchmark ingestion
+
+The exp fork includes `scripts/ingest_memory_benchmark.py`, a thin launcher for the
+agent-memory fork's Python ingestion API/CLI. The default location is the sibling
+`agent-memory` checkout; override with `--agent-memory-dir`. Use a Python environment
+with that fork's evaluation dependencies. All arguments after `--` are forwarded.
+
+```bash
+python scripts/ingest_memory_benchmark.py --python /path/to/python -- \
+  --journal /absolute/path/to/ingestion.db status --job JOB_ID
+```
+
+See the agent-memory fork's `evaluation/ingestion/README.md` for prepare/run/ready/benchmark.
+It submits all source turns through native authenticated add(infer=True), checkpoints
+progress and blocks benchmark callbacks until every supplied job is complete. It uses
+the same agent profile with explicitly persistent batch storage, not Swarm's local
+Markdown-only indexing path. Existing live prefetch/tool-call behavior is unchanged.
+There are no new HTTP upload routes. No paid benchmark is started by the launcher itself.

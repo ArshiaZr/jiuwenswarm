@@ -9,7 +9,7 @@ generated: true
 
 由 sync_documents.py 从文档 frontmatter 自动生成；请修改源文档后重新生成，不手工维护。
 
-共 22 篇文档，按模块分组；跨模块文档在各相关分组展示，总数按文档去重。
+共 23 篇文档，按模块分组；跨模块文档在各相关分组展示，总数按文档去重。
 
 ## 模块导航
 
@@ -24,7 +24,8 @@ generated: true
 | [jiuwenswarm/channels/web/frontend](#module-7) | 1 |
 | [jiuwenswarm/gateway/channel_manager/web](#module-8) | 1 |
 | [jiuwenswarm/observability](#module-9) | 1 |
-| [未分类](#module-10) | 12 |
+| [scripts](#module-10) | 1 |
+| [未分类](#module-11) | 12 |
 
 <a id="module-1"></a>
 
@@ -105,6 +106,14 @@ generated: true
 | [SDD-0025](designs/proposals/SDD-0025-trajectory-session-store-and-serving/design.md) | D | 轨迹数据面：会话级 SQLite 存储、实时变更提示与读取 API | @alan_cheng | jiuwenswarm/observability, jiuwenswarm/gateway/channel_manager/web | — | — |
 
 <a id="module-10"></a>
+
+## scripts
+
+| ID / 文档 | 类型 | 标题 | 作者 | 模块 | 代码文件 | 关联 D |
+|---|---|---|---|---|---|---|
+| [F_20261111_0005_native-benchmark-ingestion](features/F_20261111_0005_native-benchmark-ingestion.md) | F | Native benchmark ingestion launcher | Arshia Zakeri Rad | scripts | scripts/ingest_memory_benchmark.py, docs/en/Memory.md, docs/zh/记忆.md | 无独立 D：用户明确要求仅在 fork 的 exp 分支增加评测前原生数据摄入；复用跨仓 API，不另造抽取器。 |
+
+<a id="module-11"></a>
 
 ## 未分类
 
