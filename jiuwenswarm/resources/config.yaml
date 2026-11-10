@@ -160,6 +160,11 @@ memory:
   #   none     — 全部关闭
   engine: ${MEMORY_ENGINE:-builtin}
 
+  # 原生本地文件记忆的关键词预算；1–256 的整数，10 恢复旧预算。
+  # 仅限制 FTS5 词项，不截断 semantic query，不自动删除普通词。
+  query:
+    keywordMaxTerms: 64
+
   # ------------------------------------------------------------
   # 内置记忆的 jiuwen 变体（engine ∈ {builtin, both} 且 provider=jiuwen 时生效）
   # 用 JiuwenMemoryRail + AgentMemoryMemoryProvider 替换原生 MemoryRail；

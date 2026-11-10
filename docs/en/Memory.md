@@ -321,3 +321,21 @@ Query ──► FTS5 Search ──────────────┘
 ```
 
 Combined score: `score = vectorWeight * vectorScore + textWeight * textScore` (defaults: vector 0.7, text 0.3).
+
+Both vector implementations expose `(1 + cosineSimilarity) / 2`, clamped to `[0, 1]`.
+Keyword search preserves native FTS5 order (more-negative rank is stronger), converts it to
+bounded positive strength, then normalizes the eligible candidate list to a maximum of 1.
+These are ranking signals, not probabilities. Only enabled sources participate before the SQL limit.
+
+Native local keyword queries keep up to `memory.query.keywordMaxTerms` literal word terms
+(default `64`, integer range `1–256`). Set `10` to restore the earlier query budget. This setting
+limits the FTS5 expression only: semantic embeddings still receive the complete query. It does
+not remove stopwords or interpret negation as a Boolean exclusion. Invalid values are rejected
+when settings are created or loaded. Query terms remain individually quoted, including tokens
+from identifiers such as `C-prod-07`.
+
+If query embedding or vector retrieval fails, a working keyword arm uses its full score instead
+of the normal text weight. If keyword retrieval is unavailable, a working vector arm uses its full
+score. A healthy arm with no matches keeps the configured hybrid weights. Degraded searches
+are recorded in logs. Changing score normalization can change `minScore` decisions; validate
+custom thresholds against representative queries.

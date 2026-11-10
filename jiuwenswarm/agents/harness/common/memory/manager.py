@@ -17,7 +17,8 @@ from .types import (
 )
 from .internal import (
     ensure_dir, list_memory_files, build_file_entry, chunk_markdown,
-    hash_text, build_fts_query, bm25_rank_to_score, is_memory_path
+    hash_text, build_fts_query, bm25_rank_to_score, cosine_similarity_to_score, is_memory_path,
+    DEFAULT_KEYWORD_MAX_TERMS
 )
 from .embeddings import EmbeddingProvider, create_embedding_provider
 from .config import MemorySettings, create_memory_settings
@@ -834,20 +835,24 @@ class MemoryIndexManager:
         candidates = min(200, max(1, int(max_results * (hybrid.get("candidateMultiplier") or 2.0))))
 
         keyword_results = []
+        keyword_failed = not self.fts_available
         if hybrid.get("enabled", True) and self.fts_available:
             try:
                 keyword_results = await self._search_keyword(cleaned, candidates)
             except Exception as e:
+                keyword_failed = True
                 logger.debug("Keyword search failed: %s", e)
 
         query_vec = await self._embed_query_with_timeout(cleaned)
         has_vector = any(v != 0 for v in query_vec)
 
         vector_results = []
+        vector_failed = not has_vector
         if has_vector:
             try:
                 vector_results = await self._search_vector(query_vec, candidates)
             except Exception as e:
+                vector_failed = True
                 logger.debug("Vector search failed: %s", e)
 
         if not hybrid.get("enabled", True):
@@ -858,11 +863,21 @@ class MemoryIndexManager:
             results = self._filter_recent_memory_results(results)
             return results[:max_results]
 
+        vector_weight = hybrid.get("vectorWeight", 0.7)
+        text_weight = hybrid.get("textWeight", 0.3)
+        # A failed/disabled arm is different from a healthy arm with no hits.
+        if vector_failed and not keyword_failed and text_weight > 0:
+            vector_weight, text_weight = 0.0, 1.0
+            logger.warning("Memory search degraded: vector unavailable; using keyword scores")
+        elif keyword_failed and not vector_failed and vector_weight > 0:
+            vector_weight, text_weight = 1.0, 0.0
+            logger.warning("Memory search degraded: keyword unavailable; using vector scores")
+
         merged = self._merge_hybrid_results(
             vector_results,
             keyword_results,
-            hybrid.get("vectorWeight", 0.7),
-            hybrid.get("textWeight", 0.3)
+            vector_weight,
+            text_weight
         )
 
         results = [r for r in merged if r["score"] >= min_score]
@@ -929,7 +944,7 @@ class MemoryIndexManager:
                 rowid = row["rowid"]
                 if rowid in chunk_map:
                     distance = row["distance"]
-                    score = max(0, 1 - distance / 2)
+                    score = cosine_similarity_to_score(1.0 - distance)
 
                     result = chunk_map[rowid].copy()
                     result["score"] = score
@@ -985,7 +1000,7 @@ class MemoryIndexManager:
                 "startLine": int(row["start_line"]),
                 "endLine": int(row["end_line"]),
                 "snippet": str(row["text"][:SNIPPET_MAX_CHARS]),
-                "score": float(max(0, similarity))
+                "score": cosine_similarity_to_score(similarity)
             })
 
         results.sort(key=lambda x: x["score"], reverse=True)
@@ -1001,7 +1016,10 @@ class MemoryIndexManager:
             return []
 
         try:
-            fts_query = build_fts_query(query)
+            fts_query = build_fts_query(
+                query,
+                max_terms=self.settings.query.get("keywordMaxTerms", DEFAULT_KEYWORD_MAX_TERMS)
+            )
             if not fts_query:
                 return []
 
@@ -1029,11 +1047,12 @@ class MemoryIndexManager:
 
             rows = self.db.execute(f"""
                 SELECT 
-                    rowid,
-                    rank
+                    {FTS_TABLE}.rowid AS rowid,
+                    {FTS_TABLE}.rank AS rank
                 FROM {FTS_TABLE}
-                WHERE {FTS_TABLE} MATCH ?
-                ORDER BY rank
+                JOIN chunks ON chunks.rowid = {FTS_TABLE}.rowid
+                WHERE {FTS_TABLE} MATCH ? AND ({source_filter})
+                ORDER BY {FTS_TABLE}.rank
                 LIMIT ?
             """, (fts_query, limit))
 
@@ -1047,11 +1066,15 @@ class MemoryIndexManager:
                     result["score"] = float(score)
                     results.append(result)
 
+            strongest = max((result["score"] for result in results), default=0.0)
+            if strongest > 0.0:
+                for result in results:
+                    result["score"] /= strongest
             return results
 
         except Exception as e:
             logger.debug("Keyword search failed: %s", e)
-            return []
+            raise
 
     def _build_source_filter(self) -> str:
         """Build SQL filter for enabled sources."""
@@ -1060,9 +1083,9 @@ class MemoryIndexManager:
             return "1=0"
 
         if len(sources) == 1:
-            return f"source = '{sources[0]}'"
+            return f"chunks.source = '{sources[0]}'"
 
-        return f"source IN ({', '.join(repr(s) for s in sources)})"
+        return f"chunks.source IN ({', '.join(repr(s) for s in sources)})"
 
     def _merge_hybrid_results(
             self,
@@ -1075,11 +1098,13 @@ class MemoryIndexManager:
         by_id: Dict[str, Dict[str, Any]] = {}
 
         for r in vector_results:
+            r = dict(r)
             r["_vector_score"] = r["score"]
             r["_text_score"] = 0.0
             by_id[r["id"]] = r
 
         for r in keyword_results:
+            r = dict(r)
             if r["id"] in by_id:
                 by_id[r["id"]]["_text_score"] = r["score"]
             else:

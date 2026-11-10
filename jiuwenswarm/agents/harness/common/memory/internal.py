@@ -6,6 +6,7 @@ import os
 import re
 import hashlib
 import math
+from itertools import islice
 from typing import List, Dict, Any, Optional
 
 from .types import MemoryChunk
@@ -149,24 +150,48 @@ def parse_embedding(data: Any) -> Optional[List[float]]:
     return None
 
 
-def build_fts_query(query: str) -> str:
-    """Build FTS5 query from user input."""
+DEFAULT_KEYWORD_MAX_TERMS = 64
+MAX_KEYWORD_MAX_TERMS = 256
+
+
+def validate_keyword_max_terms(value: int) -> int:
+    """Validate the configurable keyword query budget without silent coercion."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= MAX_KEYWORD_MAX_TERMS
+    ):
+        raise ValueError("memory.query.keywordMaxTerms must be an integer from 1 to 256")
+    return value
+
+
+def build_fts_query(query: str, max_terms: int = DEFAULT_KEYWORD_MAX_TERMS) -> str:
+    """Build literal FTS5 OR terms under an explicit, configurable term budget."""
+    max_terms = validate_keyword_max_terms(max_terms)
     cleaned = query.strip()
     if not cleaned:
         return ""
-    
-    tokens = re.findall(r'\w+', cleaned)
-    if not tokens:
-        return ""
-    
-    return " OR ".join(f'"{t}"' for t in tokens[:10])
+    tokens = islice(re.finditer(r'\w+', cleaned), max_terms)
+    return " OR ".join(f'"{match.group()}"' for match in tokens)
 
 
 def bm25_rank_to_score(rank: float) -> float:
-    """Convert BM25 rank to similarity score (0-1)."""
-    if rank >= 0:
-        return 1.0 / (1.0 + rank)
-    return 1.0 / (1.0 - rank)
+    """Map native negative FTS5 rank monotonically to bounded lexical strength.
+
+    More-negative ranks are stronger. This is not calibrated confidence;
+    keyword search normalizes strengths within its eligible result list.
+    """
+    if not math.isfinite(rank):
+        return 0.0
+    strength = max(0.0, -rank)
+    return strength / (1.0 + strength)
+
+
+def cosine_similarity_to_score(similarity: float) -> float:
+    """Use one bounded score domain for sqlite-vec and Python cosine search."""
+    if not math.isfinite(similarity):
+        return 0.0
+    return (1.0 + max(-1.0, min(1.0, similarity))) / 2.0
 
 
 def is_memory_path(rel_path: str) -> bool:

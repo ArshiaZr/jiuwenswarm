@@ -15,6 +15,8 @@ from pathlib import Path
 
 import yaml
 
+from .internal import DEFAULT_KEYWORD_MAX_TERMS, validate_keyword_max_terms
+
 from gateway.common.mode_matrix import (
     NEW_AGENT_WORK_NORMAL,
     NEW_AGENT_WORK_PLAN,
@@ -96,6 +98,17 @@ EMBED_BASE_URL = property(lambda self: get_embed_config()["base_url"])
 EMBED_MODEL = property(lambda self: get_embed_config()["model"])
 
 
+def _validated_query_options(query: dict[str, Any]) -> dict[str, Any]:
+    """Keep keyword limits bounded for defaults, YAML configuration and overrides."""
+    if not isinstance(query, dict):
+        raise ValueError("memory.query must be a mapping")
+    result = dict(query)
+    result["keywordMaxTerms"] = validate_keyword_max_terms(
+        result.get("keywordMaxTerms", DEFAULT_KEYWORD_MAX_TERMS)
+    )
+    return result
+
+
 @dataclass
 class MemorySettings:
     """Memory configuration settings."""
@@ -110,6 +123,7 @@ class MemorySettings:
     query: Dict[str, Any] = field(default_factory=lambda: {
         "maxResults": 10,
         "minScore": 0.3,
+        "keywordMaxTerms": DEFAULT_KEYWORD_MAX_TERMS,
         "hybrid": {
             "enabled": True,
             "vectorWeight": 0.7,
@@ -137,6 +151,9 @@ class MemorySettings:
         "enabled": True,
         "maxEntries": 10000
     })
+
+    def __post_init__(self) -> None:
+        self.query = _validated_query_options(self.query)
 
 
 def create_memory_settings(
@@ -192,6 +209,7 @@ def create_memory_settings(
         if hasattr(settings, key):
             setattr(settings, key, value)
     
+    settings.query = _validated_query_options(settings.query)
     return settings
 
 
