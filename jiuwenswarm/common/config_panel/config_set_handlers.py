@@ -57,6 +57,7 @@ from jiuwenswarm.common.config import (
     replace_teams_in_config,
     update_a2ui_in_config,
     update_context_engine_enabled_in_config,
+    update_cua_agent_enabled_in_config,
     update_default_model_provider_in_config,
     update_enable_free_models_in_config,
     update_external_cli_agents_in_config,
@@ -107,6 +108,7 @@ from jiuwenswarm.common.config_panel.models_handlers import (
     build_models_defaults_from_frontend,
 )
 from jiuwenswarm.common.context_window import parse_positive_int
+from jiuwenswarm.common.cua_config import is_cua_agent_enabled, is_cua_backend_available
 from jiuwenswarm.common.moa_config import (
     MOA_CONFIG_KEYS,
     build_moa_config_from_frontend,
@@ -125,7 +127,7 @@ from jiuwenswarm.common.kv_cache_affinity_config import (
 )
 from jiuwenswarm.common.utils import get_env_file
 from jiuwenswarm.common.version import get_runtime_version
-from jiuwenswarm.common.external_providers import provider
+from jiuwenswarm.common.external_providers import ExternalProviderUnregistered, provider
 from jiuwenswarm.common.symphony_config import (
     DEFAULT_EVOLUTION_ENABLED,
     DEFAULT_SYMPHONY_ENABLED,
@@ -189,6 +191,12 @@ MULTIMODAL_RELOAD_ENV_KEYS = {
     "VISUAL_GEN_PROVIDER",
     "VISUAL_GEN_PROTOCOL",
     "VISUAL_GEN_CONTEXT_WINDOW_TOKENS",
+    "MUSIC_GEN_ENABLED",
+    "MUSIC_GEN_API_BASE",
+    "MUSIC_GEN_API_KEY",
+    "MUSIC_GEN_MODEL_NAME",
+    "MUSIC_GEN_PROVIDER",
+    "MUSIC_GEN_PROTOCOL",
 }
 ASR_ENV_KEYS = {
     "ASR_API_BASE",
@@ -316,6 +324,13 @@ CONFIG_SET_ENV_MAP = {
     "visual_gen_protocol": "VISUAL_GEN_PROTOCOL",
     "visual_gen_context_window_tokens": "VISUAL_GEN_CONTEXT_WINDOW_TOKENS",
     "visual_gen_enabled": "VISUAL_GEN_ENABLED",
+    # music generation - Design BGM slot.
+    "music_gen_api_base": "MUSIC_GEN_API_BASE",
+    "music_gen_api_key": "MUSIC_GEN_API_KEY",
+    "music_gen_model": "MUSIC_GEN_MODEL_NAME",
+    "music_gen_provider": "MUSIC_GEN_PROVIDER",
+    "music_gen_protocol": "MUSIC_GEN_PROTOCOL",
+    "music_gen_enabled": "MUSIC_GEN_ENABLED",
     # audio 模型
     "audio_api_base": "AUDIO_API_BASE",
     "audio_api_key": "AUDIO_API_KEY",
@@ -389,6 +404,7 @@ CONFIG_YAML_KEYS = frozenset({
     "memory_forbidden_description",
     "a2ui_enabled",
     "rsi_enabled",
+    "cua_agent_enabled",
     "trajectory_ui_diagnosis_enabled",
     "task_full_duplex_enabled",
     "team_organization_ui_enabled",
@@ -1239,20 +1255,42 @@ def external_cli_path_histories_from_switches(raw: dict[str, Any], params: dict[
     return merged
 
 
-def refresh_external_cli_builtin_models(external_cli_agents: list[dict[str, str]]) -> None:
+def newly_enabled_external_cli_agents(raw: dict[str, Any], external_cli_agents: list[dict[str, Any]]) -> list[str]:
+    """Return the kinds enabled by this save: absent before it, present after."""
+    persisted = get_nested_config_value(raw, EXTERNAL_CLI_AGENTS_CONFIG_PATH, [])
+    before: set[str] = set()
+    if isinstance(persisted, list):
+        for item in persisted:
+            name = item.get("cli_agent") if isinstance(item, dict) else item
+            if isinstance(name, str) and name.strip():
+                before.add(name.strip())
+    return [
+        str(item.get("cli_agent"))
+        for item in external_cli_agents
+        if isinstance(item, dict) and item.get("cli_agent") and item.get("cli_agent") not in before
+    ]
+
+
+def refresh_external_cli_builtin_models(
+    external_cli_agents: list[dict[str, str]],
+    *,
+    enabled_now: list[str] | None = None,
+) -> None:
     """Check the configured built-in model catalogs against the enabled CLIs.
 
     Runs after the dependency check, so the SDK of every enabled kind is
     installed and its cli_path resolved. A catalog naming a model the CLI
     does not offer would only fail later, when the leader picks it, so the
-    facts are corrected here. Failure never blocks the switch.
+    facts are corrected here. A kind in ``enabled_now`` lost its catalog when
+    it was turned off, so it gets one from the models its CLI reports now.
+    Failure never blocks the switch.
     """
     if not external_cli_agents:
         return
     try:
         from jiuwenswarm.common.external_cli_catalog import refresh_external_cli_builtin_models as _refresh
 
-        _refresh()
+        _refresh(enabled_now=enabled_now or ())
     except Exception as exc:  # noqa: BLE001 - a health check must not fail the switch
         logger.warning("[config.set] external CLI builtin model check failed: %s", exc)
 
@@ -1323,6 +1361,33 @@ def validate_proactive_int(
 
 def parse_config_bool(value: Any) -> bool:
     return parse_kvc_bool(value)
+
+
+def _fallback_a2ui_config_payload(raw: dict[str, Any] | None = None) -> dict[str, str]:
+    """Gateway 等未注册 a2ui provider 时，直接从 yaml/env 解析开关。"""
+    enabled = False
+    if isinstance(raw, dict):
+        section = raw.get("a2ui")
+        if isinstance(section, dict):
+            enabled = parse_config_switch_bool(section.get("enabled", False))
+    env_enabled = os.getenv("JIUWENSWARM_A2UI_ENABLED")
+    if env_enabled is not None:
+        enabled = parse_config_switch_bool(env_enabled)
+    return {"a2ui_enabled": "true" if enabled else "false"}
+
+
+def _a2ui_config_payload(raw: dict[str, Any]) -> dict[str, str]:
+    try:
+        return provider("a2ui").get_a2ui_config_payload(raw)
+    except Exception:  # noqa: BLE001 — ExternalProviderUnregistered 或装配失败
+        return _fallback_a2ui_config_payload(raw)
+
+
+def _default_a2ui_config_payload() -> dict[str, str]:
+    try:
+        return dict(provider("a2ui").get_default_a2ui_config_payload())
+    except Exception:  # noqa: BLE001
+        return _fallback_a2ui_config_payload(None)
 
 
 def _get_crypto_provider() -> Any:
@@ -1418,6 +1483,10 @@ def apply_config_payload(
         raise ConfigPanelBadRequest(
             "permissions_profile and permissions_enabled are mutually exclusive"
         )
+    if "cua_agent_enabled" in params:
+        value = params["cua_agent_enabled"]
+        if value is not None and not isinstance(value, bool) and value not in ("true", "false"):
+            raise ConfigPanelBadRequest("cua_agent_enabled must be true, false or null")
     moa_params = {key: value for key, value in params.items() if key in MOA_CONFIG_KEYS}
     if moa_params:
         try:
@@ -1513,6 +1582,8 @@ def apply_config_payload(
                 update_setup_guide_enabled_in_config(parsed)
             elif param_key == "rsi_enabled":
                 update_rsi_enabled_in_config(parsed)
+            elif param_key == "cua_agent_enabled":
+                update_cua_agent_enabled_in_config(None if val is None else parsed)
             elif param_key == "enable_free_models":
                 update_enable_free_models_in_config(parsed)
             elif param_key == "memory_forbidden_enabled":
@@ -1593,15 +1664,25 @@ def apply_config_payload(
                     update_external_cli_path_histories_in_config(
                         external_cli_path_histories_from_switches(raw, params)
                     )
-                    refresh_external_cli_builtin_models(external_cli_agents)
+                    refresh_external_cli_builtin_models(
+                        external_cli_agents,
+                        enabled_now=newly_enabled_external_cli_agents(raw, external_cli_agents),
+                    )
                     external_cli_agents_updated = True
             elif param_key == "skill_evolution":
                 update_skill_evolution_enabled_in_config(parsed)
             elif param_key == "ttse_enabled":
                 update_ttse_enabled_in_config(parsed)
             elif param_key.startswith("a2ui_"):
-                a2ui = provider("a2ui")
-                ok, update, error = a2ui.validate_a2ui_config_update(param_key, val)
+                try:
+                    a2ui = provider("a2ui")
+                    ok, update, error = a2ui.validate_a2ui_config_update(param_key, val)
+                except ExternalProviderUnregistered:
+                    # Gateway 拆仓后本进程不注册 a2ui；开关仍可写 yaml。
+                    if param_key == "a2ui_enabled":
+                        ok, update, error = True, {"enabled": parse_config_bool(val)}, ""
+                    else:
+                        ok, update, error = False, {}, f"Unknown A2UI config key: {param_key}"
                 if not ok:
                     raise ConfigPanelBadRequest(error or "invalid A2UI config")
                 update_a2ui_in_config(update)
@@ -1635,6 +1716,8 @@ def apply_config_payload(
             raise
         except Exception as e:  # noqa: BLE001
             logger.warning("[config.set] 写回 config.yaml 失败 %s: %s", param_key, e)
+            if param_key == "cua_agent_enabled":
+                raise ConfigPanelInternalError("failed to update cua_agent.enabled") from e
             if param_key == "swarmflow_enabled":
                 raise ConfigPanelInternalError("failed to update enable_swarmflow") from e
             if is_external_cli_agent_config_key(param_key):
@@ -1790,6 +1873,7 @@ async def config_get_handler(
     runtime_platform = (os.getenv("JIUWENSWARM_RUNTIME_PLATFORM") or "").strip().lower() or "default"
     payload["runtime_platform"] = runtime_platform
     payload["external_cli_agents_supported"] = "false" if runtime_platform == "harmony" else "true"
+    payload["cua_backend_available"] = "true" if is_cua_backend_available() else "false"
     # 合并 config.yaml 中的配置项
     try:
         raw = get_config_raw()
@@ -1806,6 +1890,11 @@ async def config_get_handler(
                     payload[key] = crypto_provider.decrypt(val)
         payload.update(flatten_moa_for_config_panel(raw, resolve_value=resolve_env_vars))
         react_cfg = raw.get("react") or {}
+        payload["cua_agent_enabled"] = (
+            "true" if is_cua_agent_enabled(
+                get_nested_config_value(raw, ("react", "subagents", "cua_agent"), {})
+            ) else "false"
+        )
         ctx_cfg = react_cfg.get("context_engine_config") or {}
         payload["context_engine_enabled"] = "true" if ctx_cfg.get("enabled", False) else "false"
         payload["kv_cache_affinity_enabled"] = (
@@ -1822,7 +1911,7 @@ async def config_get_handler(
         payload["memory_forbidden_enabled"] = "true" if memory_cfg.get("enabled", False) else "false"
         memory_desc = memory_cfg.get("description") or {}
         payload["memory_forbidden_description"] = memory_desc
-        payload.update(provider("a2ui").get_a2ui_config_payload(raw))
+        payload.update(_a2ui_config_payload(raw))
         trajectory_cfg = raw.get("trajectory_ui") or {}
         payload["trajectory_ui_enabled"] = (
             "true" if trajectory_cfg.get("enabled", False) else "false"
@@ -1874,6 +1963,7 @@ async def config_get_handler(
         payload.setdefault("kv_cache_affinity_enabled", "false")
         payload.setdefault("permissions_enabled", "false")
         payload.setdefault("rsi_enabled", "true")
+        payload.setdefault("cua_agent_enabled", "true" if is_cua_agent_enabled(None) else "false")
         payload.setdefault("permissions_profile", "full_access")
         payload.setdefault("setup_guide_enabled", "true")
         payload.setdefault("skill_evolution", "false")
@@ -1891,7 +1981,7 @@ async def config_get_handler(
             "true" if DEFAULT_TEAM_MEMBER_MESSAGING_ENABLED else "false",
         )
         payload.setdefault("team_member_subtasks_enabled", "false")
-        for key, value in provider("a2ui").get_default_a2ui_config_payload().items():
+        for key, value in _default_a2ui_config_payload().items():
             payload.setdefault(key, value)
         payload.setdefault("trajectory_ui_enabled", "false")
         payload.setdefault("trajectory_ui_diagnosis_enabled", "false")

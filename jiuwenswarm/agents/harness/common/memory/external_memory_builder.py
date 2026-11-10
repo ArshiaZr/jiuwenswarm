@@ -200,8 +200,8 @@ def _build_jiuwen_provider(ext_cfg: Dict[str, Any], full_config: Optional[Dict[s
       httpx — ``POST /v1/<verb>``. No local engine; just a network client.
       ``httpx`` is a jiuwenswarm core dependency.
     - ``sdk``: builds the ``agent-memory`` kernel **in-process** via
-      ``from api import assemble`` and calls it directly — no HTTP hop. The
-      ``jiuwen.sdk`` config block is the agent-memory two-level namespace dict
+      ``from jiuwen_memory.api import assemble`` and calls it directly — no HTTP hop.
+      The ``jiuwen.sdk`` config block is the agent-memory two-level namespace dict
       (globals + kv_store/fulltext_store/vector_store/llm/embedder/tokenizer);
       credentials (llm_api_key / embedder_api_key) live under ``globals`` because
       that's where agent-memory's build functions read them. Requires
@@ -347,8 +347,8 @@ def _build_jiuwen_sdk_config_dict(
     if not log_file:
         try:
             from jiuwenswarm.common.utils import get_logs_dir
-            get_logs_dir().mkdir(parents=True, exist_ok=True)
-            log_file = str(get_logs_dir() / "jiuwen_memory.log")
+            (get_logs_dir() / "agent").mkdir(parents=True, exist_ok=True)
+            log_file = str(get_logs_dir() / "agent" / "jiuwen_memory.log")
         except Exception as exc:
             logger.warning(
                 "[ExternalMemoryBuilder] resolve agent-memory log dir failed: %s", exc,

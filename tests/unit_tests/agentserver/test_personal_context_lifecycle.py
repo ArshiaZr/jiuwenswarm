@@ -108,7 +108,7 @@ async def test_agentserver_constructs_one_host_at_deployment_data_home(
     server = _server(monkeypatch)
 
     assert len(_FakePersonalContextHost.instances) == 1
-    assert _FakePersonalContextHost.instances[0].home == data_home / ".personal_context"
+    assert _FakePersonalContextHost.instances[0].home == data_home / "domain" / ".personal_context"
     assert server._personal_context_host is _FakePersonalContextHost.instances[0]  # pylint: disable=protected-access
 
 
@@ -186,9 +186,9 @@ async def test_start_restores_enabled_personal_context_state_to_agent_manager(
     monkeypatch.setattr("websockets.legacy.server.serve", _serve)
     monkeypatch.setattr(server, "_bootstrap_internal_jiuwenbox", _noop_async)
 
-    await server.start(bind_transport=True)
-    task = server._personal_context_start_task  # pylint: disable=protected-access
     try:
+        await server.start(bind_transport=True)
+        task = server._personal_context_start_task  # pylint: disable=protected-access
         assert task is not None
         await task
 
@@ -230,8 +230,8 @@ async def test_personal_context_start_failure_does_not_fail_agentserver_start(
     monkeypatch.setattr("websockets.legacy.server.serve", _serve)
     monkeypatch.setattr(server, "_bootstrap_internal_jiuwenbox", _noop_async)
 
-    await server.start(bind_transport=True)
     try:
+        await server.start(bind_transport=True)
         assert server._personal_context_start_task is not None  # pylint: disable=protected-access
         await server._personal_context_start_task  # pylint: disable=protected-access
 

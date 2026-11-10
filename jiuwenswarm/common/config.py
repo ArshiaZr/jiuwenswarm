@@ -1063,6 +1063,23 @@ def update_rsi_enabled_in_config(value: bool) -> None:
     update_config(mutator)
 
 
+def update_cua_agent_enabled_in_config(value: bool | None) -> None:
+    """Persist an explicit desktop preference, or null to follow the release default."""
+    if value is not None and not isinstance(value, bool):
+        raise ValueError("cua_agent.enabled must be true, false or null")
+
+    def mutator(data: dict[str, Any]) -> dict[str, Any]:
+        current = data
+        for key in ("react", "subagents", "cua_agent"):
+            if not isinstance(current.get(key), dict):
+                current[key] = {}
+            current = current[key]
+        current["enabled"] = value
+        return data
+
+    update_config(mutator)
+
+
 def update_enable_free_models_in_config(value: bool) -> None:
     """原子更新 models.enable_free_models（历史兼容；前端已不再暴露此开关）。"""
     def mutator(data: dict[str, Any]) -> dict[str, Any]:
@@ -3557,6 +3574,18 @@ def _migrate_legacy_kv_cache_affinity_config(user_data: dict[str, Any]) -> None:
         user_data[APPLICATION_KV_CACHE_CONFIG_KEY] = deepcopy(legacy)
 
 
+def _has_local_team_config(config: dict[str, Any]) -> bool:
+    """Check that the instance uses local team defaults or explicit local settings."""
+    team = config.get("team", {})
+    if not isinstance(team, dict):
+        return False
+    for section, key, local_value in (("runtime", "mode", "local"), ("transport", "type", "inprocess")):
+        settings = team.get(section, {})
+        if not isinstance(settings, dict) or str(settings.get(key, local_value)).strip().lower() != local_value:
+            return False
+    return True
+
+
 def migrate_config_from_template(
     template_path: Path,
     user_config_path: Path,
@@ -3620,6 +3649,15 @@ def migrate_config_from_template(
 
         # Deep merge: template provides defaults, user values preserved.
         # user_data is updated in place, which keeps comments and formatting.
+        if "extensions" in user_data and user_data["extensions"] is None:
+            template_extensions = template_data.get("extensions")
+            if (
+                isinstance(template_extensions, dict)
+                and template_extensions.get("extension_dirs") == "${EXTENSION_DIRS:-jiuwenswarm/extensions}"
+                and _has_local_team_config(user_data)
+            ):
+                # Environment-driven markers can resolve differently after a child reloads its dotenv files.
+                user_data["extensions"] = {}
         changes = _deep_merge(template_data, user_data, prune=prune)
 
         # Guard against an empty result overwriting a valid user config
@@ -3924,7 +3962,7 @@ _DEFAULT_SANDBOX_POLICY_FILE = "code-agent-policy.yaml"
 # YuanRong sandbox knobs under flat ``sandbox:`` (see get_sandbox_endpoint).
 _VALID_YUANRONG_EXECUTORS = ("default", "docker", "conch")
 _DEFAULT_YUANRONG_EXECUTOR = "docker"
-_DEFAULT_YUANRONG_URL = "http://yuanrong.local"
+_DEFAULT_YUANRONG_URL = "http://127.0.0.1:18093"
 _YUANRONG_ENDPOINT_OPTIONAL_KEYS: tuple[str, ...] = (
     "image",
     "workdir",
@@ -4199,7 +4237,7 @@ def get_sandbox_endpoint() -> dict[str, Any]:
     - 若 yaml 中存在: ``image`` / ``workdir`` / ``mounts`` / ``cpu`` /
       ``cpu_limit`` / ``memory`` / ``mem_limit`` / ``rootfs`` /
       ``user`` / ``group``
-    - ``url`` 为空时回落占位 ``http://yuanrong.local`` (仅作 cache key)
+    - ``url`` 为空时回落 ``http://127.0.0.1:18093``
 
     Raises:
         ValueError: yaml 里 ``preserve_file_sharing_mode`` 写了非法值时, 直接
@@ -4222,6 +4260,12 @@ def get_sandbox_endpoint() -> dict[str, Any]:
         result["url"] = url or _DEFAULT_YUANRONG_URL
         result["executor"] = _normalize_yuanrong_executor(sandbox.get("executor"))
         for key in _YUANRONG_ENDPOINT_OPTIONAL_KEYS:
+            if key in sandbox:
+                result[key] = sandbox[key]
+    if sandbox_type == "adx-environment":
+        for key in ("image", "runtime", "workdir", "mounts", "cpu", "cpu_limit", "memory", "mem_limit",
+                    "idle_timeout", "user", "group", "network", "connection", "env", "create_timeout",
+                    "schedule_timeout"):
             if key in sandbox:
                 result[key] = sandbox[key]
     if sandbox_type == "jiuwenbox-conch":

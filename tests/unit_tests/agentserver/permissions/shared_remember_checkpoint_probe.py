@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 async def run(root: Path, permanent: bool, phase: str) -> None:
     os.environ["JIUWENSWARM_DATA_DIR"] = str(root / "data")
-    global_path = root / "data" / "config" / "config.yaml"
+    global_path = root / "data" / "infra" / "config" / "config.yaml"
     global_path.parent.mkdir(parents=True, exist_ok=True)
     if not global_path.exists():
         global_path.write_text("permissions:\n  enabled: true\n  mode: auto\n  defaults: {'*': allow}\n  tools: {unknown_lookup: allow}\n  file_guard: {enabled: false}\n")
@@ -70,7 +70,7 @@ async def run(root: Path, permanent: bool, phase: str) -> None:
                 }
                 card = queue.reconcile(snapshot, root_session_id=session.get_session_id()).cards[0]
                 answer = InteractiveInput()
-                answer.update(card.key.invocation_id, {"approved": True, "auto_confirm": True, "persist_allow": permanent})
+                answer.update(card.key.tool_call_id, {"approved": True, "auto_confirm": True, "persist_allow": permanent})
                 reserved = queue.reserve_answer(session.get_session_id(), answer)
                 calls = []
                 async def execute(resume_ctx, tool_calls, sdk_session, _context):

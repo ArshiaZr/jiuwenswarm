@@ -53,3 +53,15 @@ YAML 和显式覆盖路径校验；manager 从设置取预算，仅传给关键�
 
 研究结果入口：工作区 `research/2026-11-05-memory-combinations/iteration-02-findings.md`。
 当前契约见 `S_01_keyword-query-budget`。实现、回归与文档一并提交至本地 exp；未合并、未部署。
+
+## 2026-11-10 upstream/develop 同步
+
+保留上游配置的 enterprise overlay、SQLite journal 设置及独立 agent_gateway
+导入，同时保留 keywordMaxTerms 默认值、校验和语义查询不截断的约束。
+新增 enterprise overlay 更新/删除后的预算回归，覆盖 DB 值优先、其余 YAML
+字段保留、非法值拒绝和删除后恢复 YAML。生成索引从合并后的全部源文档重建。
+
+Python 3.13.18 / pytest 8.4.2 下定向真实模块回归 28 例通过。Gateway/protocol
+源码使用 develop 当前钉的确切版本，依赖放在本地独立目录，不修改项目依赖锁。
+protocol 当前要求 Python <3.14，因此不将旧 Python 3.14 环境的 collection 失败
+当成搜索实现故障。未运行格式化或静态检查、完整 SDK 部署或付费模型基准。

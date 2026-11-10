@@ -390,6 +390,17 @@ if ($RsiVerifyProcess.ExitCode -ne 0) {
     throw "Frozen RSI bundle verification failed. See ~/.jiuwenswarm/logs/$BuildErrorLogName"
 }
 
+$CuaVerifier = Join-Path $ProjectRoot "scripts\verify_computer_use_bundle.py"
+$CuaVerifyProcess = Start-Process `
+    -FilePath $FrozenExe `
+    -ArgumentList @("`"$CuaVerifier`"") `
+    -Wait `
+    -PassThru `
+    -NoNewWindow
+if ($CuaVerifyProcess.ExitCode -ne 0) {
+    throw "Frozen Computer Use bundle verification failed. See ~/.jiuwenswarm/logs/$BuildErrorLogName"
+}
+
 $GitCodeVerifier = Join-Path $ProjectRoot "scripts\verify_gitcode_cli_bundle.py"
 $GitCodeVerifyProcess = Start-Process `
     -FilePath $FrozenExe `
@@ -440,6 +451,10 @@ if ($DoSign) {
         -TimestampServer $TimestampUrl
 } else {
     Write-Host "`n[3.7/4] Skipping PE signing (unsigned local build)." -ForegroundColor Yellow
+}
+
+if (Test-Truthy $BundleNode) {
+    Write-NodeRuntimeManifest -DistDir $FrozenDir
 }
 
 # 4. Build installer (Inno Setup)

@@ -24,55 +24,25 @@ def _log_preparation_stage(stage: str, began: float) -> None:
 
 def _configure_openjiuwen_logging() -> None:
     """Install OpenJiuwen logging after the Worker IPC socket is listening."""
-    from openjiuwen.core.common.logging import LogManager
-
     from jiuwenswarm.common.media_capability_config import (
         migrate_media_capability_switches,
     )
     from jiuwenswarm.common.utils import (
         apply_free_search_runtime_defaults,
+        configure_openjiuwen_core_logging,
         get_env_file,
-        get_root_dir,
     )
 
     migrate_media_capability_switches(get_env_file())
     apply_free_search_runtime_defaults()
 
-    _logging_yaml = get_root_dir() / "config" / "logging.yaml"
-    if _logging_yaml.exists():
-        from openjiuwen.core.common.logging.log_config import configure_log
-
-        configure_log(str(_logging_yaml))
+    if configure_openjiuwen_core_logging(suppress_level=logging.CRITICAL):
+        # 用户自管日志：下方权限审计处理器不再挂载。
         return
-
-    try:
-        from openjiuwen.core.common.logging.log_config import configure_log_config
-
-        _oj_home = os.environ.get("JIUWENSWARM_HOME") or os.environ.get("HOME") or os.path.expanduser("~")
-        _oj_log_dir = f"{_oj_home}/.jiuwenswarm/logs/"
-        configure_log_config({
-            "backend": "default",
-            "level": "INFO",
-            "log_path": _oj_log_dir,
-            "log_file": "run/jiuwen.log",
-            "output": ["console", "file"],
-            "structured_output_format": "json",
-            "interface_log_file": "interface/jiuwen_interface.log",
-            "prompt_builder_interface_log_file": "interface/jiuwen_prompt_builder_interface.log",
-            "performance_log_file": "performance/jiuwen_performance.log",
-        })
-    except Exception as _log_cfg_exc:  # noqa: BLE001
-        logger.warning(
-            "openjiuwen log config failed; using degraded logging: %s",
-            _log_cfg_exc,
-        )
-
-    for _lg in LogManager.get_all_loggers().values():
-        _lg.set_level(logging.CRITICAL)
 
     from jiuwenswarm.common.utils import get_logs_dir
 
-    _logs_root = get_logs_dir()
+    _logs_root = get_logs_dir() / "agent"
     _logs_root.mkdir(parents=True, exist_ok=True)
     _perm_fmt = logging.Formatter(
         "%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
@@ -143,9 +113,13 @@ def _apply_runtime_entry_patches() -> None:
         preload_bundled_team_descriptions,
     )
     from jiuwenswarm.llm_sse_patch import apply_openai_sse_invoke_patch
+    from jiuwenswarm.openjiuwen_fs_rwlock_patch import (
+        install_fs_rwlock_task_affinity_patch,
+    )
 
     install_native_tokenizer_cache()
     install_shell_tool_safety_hooks()
+    install_fs_rwlock_task_affinity_patch()
     apply_provider_compat_patches()
     try:
         install_team_workspace_read_guard()
@@ -208,10 +182,13 @@ def _prepare_worker_configuration() -> None:
     from jiuwenswarm.agents.harness.common.recommendation.topic_controls import (
         migrate_legacy_recommendation_switches,
         migrate_recommendation_consent_state,
+        repair_missing_consent_boundary,
     )
 
     migrate_legacy_recommendation_switches()
     migrate_recommendation_consent_state()
+    # Heal enabled-without-boundary left by an enable path that skipped the freeze hook.
+    repair_missing_consent_boundary()
     _log_preparation_stage("model_migrations", began)
 
 
@@ -285,8 +262,8 @@ def preload_runtime_backend() -> None:
     import openjiuwen.core.runner  # noqa: F401
     _log_preparation_stage("runner_import", began)
     began = time.monotonic()
-    import gateway.extensions.manager  # noqa: F401
-    import gateway.extensions.registry  # noqa: F401
+    import agent_gateway.extensions.manager  # noqa: F401
+    import agent_gateway.extensions.registry  # noqa: F401
     _log_preparation_stage("extension_imports", began)
     began = time.monotonic()
     import jiuwenswarm.server.agent_ws_server  # noqa: F401

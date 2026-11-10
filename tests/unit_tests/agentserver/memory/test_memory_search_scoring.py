@@ -224,3 +224,25 @@ def test_hybrid_merge_does_not_modify_or_rescale_cached_inputs(manager):
     assert first == second
     assert vectors == [{"id": "one", "score": 0.8}]
     assert keywords == [{"id": "one", "score": 1.0}]
+
+
+def test_keyword_budget_survives_enterprise_memory_overlay_and_delete(monkeypatch):
+    monkeypatch.setattr(memory_config, "is_enterprise", lambda: True)
+    monkeypatch.setattr(memory_config, "_memory_config_db_cache", None)
+    monkeypatch.setattr(memory_config, "_memory_config_cache_source", None)
+    monkeypatch.setattr(memory_config, "_load_config", lambda: {
+        "memory": {"query": {"keywordMaxTerms": 10, "maxResults": 7}},
+    })
+    memory_config.apply_memory_config_payload({
+        "op": "upsert", "body": {"query": {"keywordMaxTerms": 32}},
+    })
+    settings = memory_config.create_memory_settings()
+    assert settings.query["keywordMaxTerms"] == 32
+    assert settings.query["maxResults"] == 7
+    memory_config.apply_memory_config_payload({
+        "op": "upsert", "body": {"query": {"keywordMaxTerms": 0}},
+    })
+    with pytest.raises(ValueError, match="keywordMaxTerms"):
+        memory_config.create_memory_settings()
+    memory_config.apply_memory_config_payload({"op": "delete"})
+    assert memory_config.create_memory_settings().query["keywordMaxTerms"] == 10

@@ -3,6 +3,7 @@ import type { OutputOrder } from '../types/message';
 import { Message, MessageRole, UsageSummary, FileDownloadItem, MediaItem, WsEvent, ToolExecution, AskUserQuestionPayload, Question, UserAnswer, SessionTokenUsageSnapshot, parseSessionTokenUsageSnapshot } from '../types';
 import { webClient } from '../services/webClient';
 import { normalizeFinalContent } from '../utils/finalContent';
+import { describeChatError } from './free-models/chatError';
 import { mergeFileDownloadItems } from '../utils/fileDownloadDedup';
 import { parseTimestampToMs, timestampMsToIso } from '../utils/timestamp';
 import { extractAutomation } from '../utils/heartbeatAutomation';
@@ -21,6 +22,7 @@ import {
   isGoalCompletedContent,
 } from '../components/GoalBar/goalCompletedMessage';
 import { HistoryRecordReassembler } from './historyRecordReassembler';
+import { stripMentionAppendix } from './designer/designerMentions';
 import { expertTeamId } from './teamOrganization/conversation';
 import { isTeamOrganizationUiEnabled } from './teamOrganization/featureConfig';
 import { readAgentTemplateName } from './agentIdentity';
@@ -29,6 +31,8 @@ import {
   isTeamLeaderContextUsageSnapshot,
   parseContextUsageSnapshot,
 } from './contextUsage/contextUsageModel';
+import { isEnterprise } from '../edition';
+import { isTeamAgentMode } from './planMode/wireMode';
 
 export { HistoryRecordReassembler };
 
@@ -529,6 +533,8 @@ interface BeginHistoryRestoreOptions {
   onSessionTokenUsage?: (payload: SessionTokenUsageSnapshot) => void;
   /** 恢复问题澄清对话框（chat.ask_user_question），重新入 pendingQuestion 队列弹交互框 */
   onPendingQuestionReplay?: (items: HistoryPendingQuestionReplayItem[]) => void;
+  /** 恢复已答的问题澄清（chat.ask_user_answer），用于丢弃快照重新派发的过期问题 */
+  onAnsweredQuestionReplay?: (items: HistoryAnsweredQuestionReplayItem[]) => void;
   /** Called only when the exhausted snapshot has no restorable content. */
   onEmpty?: (cursor: HistoryCursorMeta) => void;
   onFailure?: (failure: HistoryRestoreFailure) => void;
@@ -717,7 +723,9 @@ function safeTimestampMs(value: unknown): number {
 }
 
 function isTeamModeRecord(record: Record<string, unknown>): boolean {
-  return typeof record.mode === 'string' && record.mode.trim().toLowerCase() === 'team';
+  const mode = typeof record.mode === 'string' ? record.mode.trim().toLowerCase() : '';
+  if (!isEnterprise()) return mode === 'team';
+  return isTeamAgentMode(mode);
 }
 
 function isTeamTeammateMessageRecord(record: Record<string, unknown>): boolean {
@@ -890,6 +898,14 @@ function normalizeHistoryMediaItem(value: unknown): MediaItem | null {
     return null;
   }
 
+  // The composer draft's own id (session.assets.register's idempotency key),
+  // persisted by the backend (_history_media_record, interface.py) specifically so
+  // resolveAssetDisplayNames can match a restored message's attachment back to the
+  // ONE asset it actually created -- a path can now legitimately back more than
+  // one asset (a deliberate re-attach), so matching by path alone after a reload
+  // would resolve to whichever asset happens to be newest.
+  const clientId = pickFirstString(value, ['client_id', 'clientId']);
+
   return {
     type,
     filename,
@@ -897,6 +913,7 @@ function normalizeHistoryMediaItem(value: unknown): MediaItem | null {
     mime_type: mimeType,
     mimeType,
     ...(typeof size === 'number' ? { size_bytes: size, sizeBytes: size } : {}),
+    ...(clientId ? { clientId } : {}),
   };
 }
 
@@ -931,7 +948,7 @@ function appendHistoryMediaItems(
   }
 }
 
-function extractHistoryMediaItems(record: Record<string, unknown>): MediaItem[] {
+export function extractHistoryMediaItems(record: Record<string, unknown>): MediaItem[] {
   const mediaItems: MediaItem[] = [];
   const seenKeys = new Set<string>();
 
@@ -1126,7 +1143,8 @@ function parseSessionHistoryTimelineEntry(
         id,
         role: 'user',
         outputOrder: readOutputOrder(record) ?? readOutputOrder(eventPayload),
-        content,
+        // A design "@" mention carries a leader-only appendix; show the user's own text.
+        content: stripMentionAppendix(content),
         timestamp: at,
         ...(forkedFromSessionId ? { forkedFromSessionId } : {}),
         ...(mediaItems.length > 0 ? { mediaItems } : {}),
@@ -1162,6 +1180,34 @@ function parseSessionHistoryTimelineEntry(
         ? 'subagent_activity'
         : 'subagent_message';
     return { kind, at: replay.at, payload: replay.payload };
+  }
+
+  if (eventType === 'chat.notice') {
+    const noticePayload = buildEventPayloadForRecord(record);
+    const noticeType = pickFirstString(noticePayload, ['notice_type', 'type'])
+      ?? pickFirstString(record, ['notice_type', 'type'])
+      ?? '';
+    if (
+      noticeType !== 'requested_team_size'
+      && noticeType !== 'team_quota'
+      && noticeType !== 'team_teammate_quota'
+    ) {
+      return null;
+    }
+    const noticeContent = pickFirstString(noticePayload, ['content', 'message', 'text'])
+      ?? (typeof record.content === 'string' ? record.content : '');
+    if (!noticeContent.trim()) return null;
+    const noticeId = pickFirstString(record, ['id', 'message_id'])
+      ?? `notice-${noticeType}-${sessionId}-${at}`;
+    return {
+      kind: 'message',
+      message: {
+        id: noticeId,
+        role: 'system',
+        content: noticeContent,
+        timestamp: at,
+      },
+    };
   }
 
   if (!ALLOWED_ASSISTANT_EVENT_TYPES.has(eventType)) {
@@ -1206,11 +1252,8 @@ function parseSessionHistoryTimelineEntry(
   }
 
   if (eventType === 'chat.error') {
-    // 后端仅 interface.py 一处把 chat.error 落盘（content=str(data)，error_type 在顶层，
-    // code 未落盘——见 interface.py:4040 的 extra 只带 error_type）。历史恢复时转成
-    // role=system 消息，与实时 useWebSocket.ts chat.error 分支对齐（实时 content=
-    // t('network.errorPrefix', {message})，历史层无 i18n，直接用错误原文）。
-    // code 缺失无法走 describeChatError 翻译生命周期错误，仅展示原文。
+    // Use the same stable-code guidance as live delivery. Older records without
+    // a known code keep their original diagnostic text.
     const errContent =
       (typeof record.content === 'string' && record.content) ||
       (typeof payload.content === 'string' && payload.content) ||
@@ -1220,12 +1263,17 @@ function parseSessionHistoryTimelineEntry(
     }
     const restoredId =
       pickFirstString(record, ['id', 'message_id', 'msg_id']) ?? `hist-error-${sessionId}-${at}`;
+    const errorMsg = describeChatError(
+      { code: record.code ?? payload.code, upstream: record.upstream ?? payload.upstream },
+      errContent,
+      (key) => i18n.t(key),
+    );
     return {
       kind: 'message',
       message: {
         id: restoredId,
         role: 'system',
-        content: errContent,
+        content: errorMsg,
         timestamp: at,
         ...(forkedFromSessionId ? { forkedFromSessionId } : {}),
       },
@@ -1233,6 +1281,11 @@ function parseSessionHistoryTimelineEntry(
   }
 
   if (eventType === 'chat.final') {
+    // A full-duplex task's raw Core answer (with its spoken-brief markers) is never shown
+    // live; the duplex runtime persists the clean result as its own tool_result reply.
+    if (record.channel_id === 'video_tool' || payload.channel_id === 'video_tool') {
+      return null;
+    }
     // Goal 完成卡片落盘的是 `goal.completed:` + JSON 信封，不是展示文本。
     // normalizeFinalContent 会把字面 `\n` 还原成真换行（GFM 表格要靠这个），信封里的
     // JSON 字符串于是带上非法控制符，parseGoalCompletedContent 解析失败 →
@@ -1296,13 +1349,11 @@ function parseSessionHistoryTimelineEntry(
         ? proactiveAssistantMessageId(histProactiveRecId)
         : restoredId;
     // completed_at：收尾时刻（耗时）；timestamp 已是气泡出现/首包时刻（排序）
-    const completedAt =
-      (typeof record.completed_at === 'number' || typeof record.completed_at === 'string'
-        ? recordTimestampIso({ timestamp: record.completed_at })
-        : undefined) ||
-      (typeof payload.completed_at === 'number' || typeof payload.completed_at === 'string'
-        ? recordTimestampIso({ timestamp: payload.completed_at })
-        : undefined);
+    const recordCompletedAtMs = parseTimestampToMs(record.completed_at);
+    const completedAtMs = Number.isFinite(recordCompletedAtMs)
+      ? recordCompletedAtMs
+      : parseTimestampToMs(payload.completed_at);
+    const completedAt = timestampMsToIso(completedAtMs);
     return {
       kind: 'message',
       message: {
@@ -1321,7 +1372,7 @@ function parseSessionHistoryTimelineEntry(
         ...(record.channel_id === 'video_duplex' || payload.channel_id === 'video_duplex'
           ? { keepExpanded: true }
           : {}),
-        ...(completedAt ? { completedAt } : {}),
+        ...(completedAt ? { completedAt, outputReplayUntil: completedAtMs } : {}),
         ...(isProactiveRecommendation ? { isProactiveRecommendation } : {}),
         ...(isProactiveRecommendation && histProactiveType
           ? { proactiveType: histProactiveType as 'skill_recommend' | 'task_reminder' | 'need_exploration' }
@@ -2175,6 +2226,7 @@ function buildToolExecutionsFromReplay(toolReplay: HistoryToolReplayItem[]): Too
       summary: n.summary,
       skillTree: n.skillTree,
       ...(n.mermaid ? { mermaid: n.mermaid } : {}),
+      ...(n.mcpApp ? { mcpApp: n.mcpApp } : {}),
       ...(n.timedOut ? { timedOut: true as const } : {}),
       ...(n.beamSearch ? { beamSearch: n.beamSearch } : {}),
       reviewer: n.reviewer,
@@ -2558,6 +2610,9 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
       }
       if (pendingQuestionReplay.length > 0) {
         options.onPendingQuestionReplay?.(pendingQuestionReplay);
+      }
+      if (answeredQuestionReplay.length > 0) {
+        options.onAnsweredQuestionReplay?.(answeredQuestionReplay);
       }
       const compactionCount = entries.reduce((n, e) => (e.kind === 'compaction' ? n + 1 : n), 0);
       if (compactionCount > 0) {

@@ -306,7 +306,7 @@ async def test_runtime_prompt_describes_projectless_agent_task_dirs(
         lambda: agent_dir,
     )
     monkeypatch.setattr(
-        "jiuwenswarm.agents.harness.common.rails.runtime_prompt_rail.get_user_workspace_dir",
+        "jiuwenswarm.agents.harness.common.rails.runtime_prompt_rail.get_domain_data_dir",
         lambda: tmp_path,
     )
     monkeypatch.setattr(
@@ -694,7 +694,11 @@ async def test_agent_manager_uses_project_dir_not_workspace_dir_for_identity(
         assert await manager.process_message(request) == "ok"
 
     lookup.assert_awaited_once_with(
-        channel_id="web", mode=mode, project_dir=expected_project, sub_mode=None,
+        channel_id="web",
+        mode=mode,
+        project_dir=expected_project,
+        sub_mode=None,
+        request=request,
     )
     assert seen_requests == [request]
     assert seen_requests[0] is request
@@ -741,7 +745,11 @@ async def test_manager_project_identity_respects_explicit_and_admitted_values(
 
     assert agent is lookup.return_value
     lookup.assert_awaited_once_with(
-        channel_id="web", mode=mode, project_dir=expected_project, sub_mode=None,
+        channel_id="web",
+        mode=mode,
+        project_dir=expected_project,
+        sub_mode=None,
+        request=request,
     )
     assert admissions == ([request] if with_callback else [])
     assert vars(request) == original_fields

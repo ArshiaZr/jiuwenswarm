@@ -9,9 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from agent_gateway.extensions.agentos.config_updater.client import FetchResult
+from agent_gateway.extensions.agentos.config_updater.service import ConfigUpdaterApplier, ConfigUpdaterService
+
 from jiuwenswarm.common.etcd.client import EtcdError, _extract_watch_kvs
-from gateway.extensions.agentos.config_updater.client import FetchResult
-from gateway.extensions.agentos.config_updater.service import ConfigUpdaterApplier, ConfigUpdaterService
 
 
 class ConfigUpdaterTest(unittest.IsolatedAsyncioTestCase):
@@ -178,7 +179,7 @@ class SandboxBoundaryTest(unittest.TestCase):
                  patch.object(builder, "Path", side_effect=lambda value: project if value == "~/workspace" else Path(value)):
                 result = builder._build_yuanrong_extra_params()
             self.assertEqual(result["mounts"], [
-                {"source": str(user_dir / ".jiuwenswarm" / "agent" / "workspace"),
+                {"source": str(user_dir / ".jiuwenswarm" / "domain" / "agent" / "workspace"),
                  "target": str(workspace), "readonly": False},
                 {"source": str(user_dir / "workspace"), "target": str(project), "readonly": False},
             ])
@@ -275,7 +276,7 @@ class CodeGraphTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(adapter._code_graph_sdk_available)
 
     async def test_missing_sdk_keeps_text_search_and_status_reports_unavailable(self):
-        from jiuwenswarm.server.agent_ws_server import resolve_status_code_graph
+        from jiuwenswarm.server.handlers.commands import resolve_status_code_graph
 
         adapter = self.adapter()
         config = {"code_graph": {"profile": "graph", "agent": "root"}}

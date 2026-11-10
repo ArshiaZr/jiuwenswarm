@@ -19,7 +19,6 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_model import (
 )
 from jiuwenswarm.common.auth.model_catalog import is_login_model
 from jiuwenswarm.common.config import (
-    get_available_models,
     get_config,
     get_default_models,
     update_config,
@@ -194,6 +193,33 @@ def freeze_consent_boundary(now: float) -> None:
         )
 
 
+def repair_missing_consent_boundary(now: float | None = None) -> bool:
+    """Freeze a missing boundary when topics are already enabled.
+
+    ``topic_enabled`` can land in YAML without the store-side freeze (settings write through
+    ``common.recommendation_switches`` before the agent hook is registered). Across restarts the
+    switch stays on while ``history_after`` stays ``None``, so every turn is excluded and
+    generation abstains with ``no_eligible_history``. Repair freezes at ``now``; earlier turns
+    stay outside the boundary unless the user opts into include-history.
+    """
+
+    from jiuwenswarm.agents.harness.common.recommendation.switches import (
+        is_topic_recommendation_enabled,
+    )
+
+    if not is_topic_recommendation_enabled():
+        return False
+    if _consent_state()["history_after"] is not None:
+        return False
+    moment = time.time() if now is None else now
+    freeze_consent_boundary(moment)
+    logger.info(
+        "[Recommendation] repaired missing consent boundary at history_after=%s",
+        moment,
+    )
+    return True
+
+
 def migrate_legacy_recommendation_switches() -> bool:
     """Retire ``recommendation.enabled`` onto the two switches it used to drive.
 
@@ -287,7 +313,7 @@ def _unusable_reason(entry: dict[str, Any]) -> str | None:
 
 
 def _chosen_entry(config: dict[str, Any], entries: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """The entry chosen in settings, or None to follow the main model (also when the chosen one was removed)."""
+    """Return only the explicitly chosen entry, never an implicit chat model."""
     section = config.get("recommendation")
     model_id = str(section.get("model") or "") if isinstance(section, dict) else ""
     if model_id in ("", FOLLOW_MAIN_MODEL):
@@ -295,31 +321,45 @@ def _chosen_entry(config: dict[str, Any], entries: list[dict[str, Any]]) -> dict
     return next((entry for entry in entries if str(entry.get("model_id") or "") == model_id), None)
 
 
-def _main_model(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """The model a new chat uses by default: the default entry of the first listed model name."""
-    if not entries:
-        return None
-    name = _model_name(entries[0])
-    return next((entry for entry in entries if _model_name(entry) == name and entry.get("is_default") is True),
-                entries[0])
-
-
 def recommendation_model_options(auth_session: str | None) -> dict[str, Any]:
-    """The chat models the topic model can be chosen from, each with why it cannot be when it cannot."""
-    config = get_config()
-    entries = [entry for entry in get_available_models(config, auth_session) if _model_name(entry)]
-    chosen = _chosen_entry(config, entries)
+    """Status fields for the active topic model only; do not list the chat catalog.
+
+    Dedicated ``model_config`` is the product path. A legacy ``recommendation.model``
+    binding reports its id only when that entry still exists in the chat catalog.
+    ``model_options`` stays empty so status no longer ships every configured chat
+    model to the UI.
+    """
+
+    del auth_session
+    dedicated = recommendation_model_configuration()
+    dedicated_name = str(dedicated.get("model") or "").strip()
+    if dedicated_name:
+        return {
+            "configured_model": dedicated_name,
+            "selected_model": dedicated_name,
+            "model_options": [],
+        }
+    section = get_config().get("recommendation") or {}
+    model_id = str(section.get("model") or "").strip() if isinstance(section, dict) else ""
+    if model_id in ("", FOLLOW_MAIN_MODEL):
+        model_id = ""
+    elif not any(
+        str(entry.get("model_id") or "") == model_id
+        for entry in get_default_models(get_config())
+    ):
+        # Stale binding: not selected and not inherited as a chat model.
+        model_id = ""
     return {
-        "selected_model": str(chosen["model_id"]) if chosen is not None else FOLLOW_MAIN_MODEL,
-        "model_options": [{"model_id": str(entry.get("model_id") or ""),
-                           "name": str(entry.get("alias") or "") or _model_name(entry),
-                           "disabled_reason": _unusable_reason(entry)} for entry in entries],
+        "configured_model": model_id,
+        "selected_model": model_id,
+        "model_options": [],
     }
 
 
 def save_recommendation_model(model: str) -> bool:
-    """Keep the topic model choice: ``follow_main`` or the ID of a configured model the chain can call."""
-    if model != FOLLOW_MAIN_MODEL:
+    """Keep a model id, or clear the binding and disable topics for an empty id."""
+    # Clearing a binding must not depend on the old model still being available or usable.
+    if model:
         entries = [entry for entry in get_default_models(get_config()) if _model_name(entry)]
         entry = next((entry for entry in entries if str(entry.get("model_id") or "") == model), None)
         if entry is None or _unusable_reason(entry) is not None:
@@ -330,7 +370,64 @@ def save_recommendation_model(model: str) -> bool:
         if not isinstance(section, dict):
             section = config["recommendation"] = {}
         section["model"] = model
+        if not model:
+            section.pop("model_config", None)
+            section["topic_enabled"] = False
         return config
+    update_config(mutate)
+    return True
+
+
+def recommendation_model_configuration(*, include_api_key: bool = False) -> dict[str, Any]:
+    """Return dedicated configuration, optionally including the key for editing."""
+    section = get_config().get("recommendation") or {}
+    stored = section.get("model_config") if isinstance(section, dict) else None
+    if not isinstance(stored, dict):
+        return {}
+    payload = {
+        key: value
+        for key, value in stored.items()
+        if key != "api_key" or include_api_key
+    }
+    payload["has_api_key"] = bool(stored.get("api_key"))
+    # Settings always edits an explicit window; legacy rows fall back here.
+    payload["context_window_tokens"] = (
+        parse_positive_int(stored.get("context_window_tokens"))
+        or RECOMMENDATION_CONTEXT_WINDOW_TOKENS
+    )
+    return payload
+
+
+def save_recommendation_model_configuration(values: dict[str, Any]) -> bool:
+    """Save an independent OpenAI-compatible connection, never a chat catalog entry."""
+    fields = ("model", "provider", "api_base", "api_key", "vendor_key", "plan", "endpoint_profile")
+    if any(key in values and not isinstance(values[key], str) for key in fields):
+        return False
+    clean = {key: str(values.get(key) or "").strip() for key in fields}
+    if clean["provider"] != "OpenAI" or not clean["model"] or len(clean["model"]) > 100:
+        return False
+    if not clean["api_base"].startswith(("http://", "https://")) or len(clean["api_base"]) > 512:
+        return False
+    context_window_tokens = parse_positive_int(values.get("context_window_tokens"))
+    if context_window_tokens is None:
+        return False
+    section = get_config().get("recommendation") or {}
+    previous = (section.get("model_config") or {}) if isinstance(section, dict) else {}
+    if not clean["api_key"] and isinstance(previous, dict):
+        if all(clean[key] == previous.get(key) for key in ("api_base", "provider", "vendor_key", "plan")):
+            clean["api_key"] = str(previous.get("api_key") or "")
+    if not clean["api_key"] or len(clean["api_key"]) > 2048:
+        return False
+    clean["context_window_tokens"] = context_window_tokens
+
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        target = config.get("recommendation")
+        if not isinstance(target, dict):
+            target = config["recommendation"] = {}
+        target["model_config"] = clean
+        target["model"] = ""
+        return config
+
     update_config(mutate)
     return True
 
@@ -339,16 +436,31 @@ def recommendation_model_config(environ: Any = None) -> ArkBackgroundConfig | No
     """The topic chain's model: a complete environment override, else the chat model chosen in settings.
 
     The override applies only when ``ARK_API_KEY``, ``ARK_MODEL``, ``ARK_BASE_URL`` and
-    ``ARK_CONTEXT_WINDOW_TOKENS`` are all set. Otherwise the choice is ``follow_main`` or one
-    configured chat model. Name, endpoint, key and window come from that entry. None when
+    ``ARK_CONTEXT_WINDOW_TOKENS`` are all set. Otherwise the choice is one configured
+    model id. An unset choice or a legacy ``follow_main`` value has no model.
+    Name, endpoint, key and window come from the explicit entry. None when
     that model cannot be called this way.
     """
     override = ArkBackgroundConfig.from_environ(environ)
     if override is not None:
         return override
     config = get_config()
+    section = config.get("recommendation") or {}
+    dedicated = section.get("model_config") if isinstance(section, dict) else None
+    if isinstance(dedicated, dict):
+        if not all(dedicated.get(key) for key in ("api_key", "api_base", "model")):
+            return None
+        return ArkBackgroundConfig(
+            api_key=dedicated["api_key"],
+            model=dedicated["model"],
+            base_url=dedicated["api_base"],
+            context_window_tokens=(
+                parse_positive_int(dedicated.get("context_window_tokens"))
+                or RECOMMENDATION_CONTEXT_WINDOW_TOKENS
+            ),
+        )
     entries = [entry for entry in get_default_models(config) if _model_name(entry)]
-    entry = _chosen_entry(config, entries) or _main_model(entries)
+    entry = _chosen_entry(config, entries)
     if entry is None or _unusable_reason(entry) is not None:
         return None
     client = entry.get("model_client_config") or {}

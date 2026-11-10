@@ -41,8 +41,8 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_news import (
     HotListFeed,
     HotListPull,
     hot_event_key,
+    hot_list_open_url,
     normalize_news_query,
-    search_page_url,
 )
 from jiuwenswarm.agents.harness.common.recommendation.topic_outcomes import (
     RIDUserContextSnapshot,
@@ -59,12 +59,14 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_prepare import (
 )
 from jiuwenswarm.agents.harness.common.recommendation.topic_product import (
     COMPONENT_INVOCATION_RECEIPT_VERSION,
+    DEFAULT_TOPIC_WORK_MODE,
     GLOBAL_NEW_CHAT_SCOPE,
     GLOBAL_PROJECT_BUCKETS,
     GROUNDING_DECISION_RECEIPT_VERSION,
     GROUNDING_EVIDENCE_RECEIPT_VERSION,
     HOT_LIST_ENTRY_RECEIPT_VERSION,
     HOT_LIST_SOURCE_KIND,
+    LIST_SEARCH_VERSION,
     NEWS_ONLY_SUCCESSOR,
     PAYLOAD_VERSION,
     POLICY_ID,
@@ -79,9 +81,12 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_product import (
     build_serving_compatibility_key,
     build_terminal_card,
     card_copy_rejection_reason,
+    card_is_news,
+    is_cold_start_card,
     load_exact_global_pool,
     memory_evidence_id,
     news_lead_card_id,
+    normalize_topic_work_mode,
     project_id_for_scope,
     provider_receipt_applies_to_card,
     retainable_pool,
@@ -107,11 +112,13 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_retrieval import (
 )
 from jiuwenswarm.agents.harness.common.recommendation.topic_search import (
     OPENJIUWEN_NATIVE_SEARCH_PROVIDER_ID,
+    UNCONFIGURED_SEARCH_PROVIDER_ID,
     OpenJiuwenNativeSearchContractError,
     OpenJiuwenNativeSearchProviderError,
     OpenJiuwenNativeSearchResult,
     build_topic_search_provider,
     selected_topic_search_provider_id,
+    topic_web_search_engines_enabled,
 )
 from jiuwenswarm.agents.harness.common.recommendation.topic_selection import (
     DIVERSITY_COMPONENT_ID,
@@ -122,7 +129,6 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_selection import (
     ListSearchConstraints,
     SelectionCandidate,
     hybrid_list_search,
-    mine_hierarchical_pairs,
     news_only_search_result,
     score_diversity,
     score_interaction_utility,
@@ -157,6 +163,7 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_starter import (
 from jiuwenswarm.agents.harness.common.recommendation.topic_terminal import (
     RID_API_PROMPT_VERSION,
     RID_COMPONENT_ID,
+    _RID_API_SYSTEM_PROMPT,
     TERMINAL_CONTRACT_VERSION,
     ArkRIDDistillationAdapter,
     LearnedComponentBinding,
@@ -167,11 +174,13 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_terminal import (
     SessionSummaryArtifact,
     distill_trigger_interests,
     eligible_natural_revisit_summaries,
+    is_user_revisit_eligible,
 )
 from jiuwenswarm.server.runtime.session.project_store import list_projects
 from jiuwenswarm.server.runtime.session.session_history import (
     SESSION_REQUEST_COMPLETED_EVENT,
     CompletedSessionPrefix,
+    SessionCompletionBoundary,
     project_completed_session_prefix,
     project_completed_session_records,
 )
@@ -179,19 +188,19 @@ from jiuwenswarm.server.runtime.session.session_metadata import (
     get_all_sessions_metadata,
 )
 
-SESSION_SUMMARY_CONFIG_VERSION = "topic-starter-v6-session-summary-api-v9"
+SESSION_SUMMARY_CONFIG_VERSION = "topic-starter-v6-session-summary-api-v10"
 RID_ABSTENTION_RECEIPT_VERSION = "topic-starter-v6-rid-abstention-v1"
 RID_DECISION_EVENT_TYPE = "rid_decision"
 _RID_THRESHOLD_VERSION = "icebreaker-api-proxy-threshold-v1"
 # The fallback reason of an RID receipt whose round left it nothing to judge.
 _RID_NOTHING_TO_JUDGE = "no_rid_input"
-GLOBAL_INTEREST_PROMPT_VERSION = "topic-starter-v6-global-interest-v25"
+GLOBAL_INTEREST_PROMPT_VERSION = "topic-starter-v6-global-interest-v26"
 PROJECT_CONTINUATION_PROMPT_VERSION = "topic-starter-v6-project-continuation-v15"
-MEMORY_INCREMENTAL_PROMPT_VERSION = "topic-starter-v6-memory-incremental-v7"
+MEMORY_INCREMENTAL_PROMPT_VERSION = "topic-starter-v6-memory-incremental-v8"
 RECENT_PLANNER_PROMPT_VERSION = "topic-starter-v6-recent-planner-v5"
 RECENT_FINALIZER_PROMPT_VERSION = "topic-starter-v6-recent-finalizer-v2"
 PROJECT_DOMAIN_PROMPT_VERSION = "topic-starter-v6-project-domain-v3"
-HOT_NEWS_MATCHER_PROMPT_VERSION = "topic-starter-v6-hot-news-matcher-v5"
+HOT_NEWS_MATCHER_PROMPT_VERSION = "topic-starter-v6-hot-news-matcher-v6"
 BEHAVIOR_MAPPING_PROMPT_VERSION = "topic-starter-v6-behavior-mapping-v2"
 MEMORY_INIT_PROMPT_VERSION = "topic-starter-v6-memory-init-v1"
 UTILITY_CONFIG_VERSION = "topic-starter-v6-utility-api-v41"
@@ -226,8 +235,38 @@ _EXTRACTOR_AUDIT_PROVIDER_ID = "host-exact-offset-extractor"
 logger = logging.getLogger(__name__)
 
 # A scope with more unsummarized conversations than this is summarized by its own generation.
-_PREPARED_SUMMARY_LIMIT = 3
+# The generation side batches, so a few more can be prepared in the background.
+_PREPARED_SUMMARY_LIMIT = 8
 _RECENT_CATEGORIES = frozenset({"profile_recent_progress", "project_domain_progress"})
+
+# One session's summarizer input is bounded so a long conversation cannot grow
+# the prompt with its turn count: only the newest turns are read, each text is
+# clipped, and the session stops at its character budget. The same turns are
+# the ones a summary claims to cover. History files stay complete; this bound
+# is only the model input. The caller then drops the oldest turns of a session
+# that still misses the token budget, and packs the remaining sessions into as
+# many calls as the context window needs. The policy is part of every request,
+# so a provider receipt shows the bound in force.
+_SUMMARY_INPUT_POLICY_VERSION = "topic-starter-v6-session-summary-input-v1"
+_SUMMARY_MAX_TURNS_PER_SESSION = 20
+_SUMMARY_MAX_USER_CHARS = 1_500
+_SUMMARY_MAX_ANSWER_CHARS = 1_500
+_SUMMARY_MAX_SESSION_CHARS = 8_000
+_SUMMARY_TRUNCATION_MARKER = "…"
+_SUMMARY_RESERVED_OUTPUT_TOKENS = 256
+_SUMMARY_BASE_RESERVED_OUTPUT_TOKENS = 512
+# Batches are independent calls; a first preparation of a long history would
+# otherwise serialize past the run's deadline, and sending all of them at once
+# would invite provider throttling.
+_SUMMARY_BATCH_CONCURRENCY = 3
+# Only conversations completed inside this window, newest first, are summarized:
+# older ones survive through Memory, not through a session summary.
+_SUMMARY_SESSION_WINDOW_SECONDS = 90 * 24 * 60 * 60
+_SUMMARY_SESSION_LIMIT = 50
+# RID reads a bounded slice of the summaries; the short-delta sessions are always kept.
+_RID_SESSION_SUMMARY_LIMIT = 30
+_RID_FEEDBACK_MESSAGE_CHARS = 800
+_RID_RESERVED_OUTPUT_TOKENS = 2_048
 
 
 _ORIGINAL_SOURCE_HOSTS = frozenset(
@@ -350,7 +389,7 @@ StageInvoker = Callable[[str, str, str], Awaitable[Any]]
 StageInvokerFactory = Callable[[ArkBackgroundConfig], StageInvoker]
 WebSearchFn = Callable[[str, int, int], Awaitable[Any]]
 WebSearchProviderFactory = Callable[[ArkBackgroundConfig], WebSearchFn]
-ContextLoader = Callable[[str], "V6ContextSnapshot"]
+ContextLoader = Callable[[str, str], "V6ContextSnapshot"]
 RecordsLoader = Callable[[], dict[str, list[dict[str, Any]]]]
 
 
@@ -468,39 +507,19 @@ _V6_MEMORY_INIT_SYSTEM_PROMPT = (
     "本人兴趣。明确区分稳定偏好、临时目标、已完成事项与暂时暂停。"
 )
 _V6_MEMORY_INCREMENTAL_SYSTEM_PROMPT = (
-    "你是 Topic Starter v6 的 RecGPT-v3 长期画像增量整理器。只输出 JSON "
+    "Topic Starter v6 长期画像增量整理。快速决定，只输出 JSON "
     "{\"updated_units\":[...],\"new_units\":[...],"
-    "\"unmatched_behavior_indices\":[...]}。updated_units 必须逐个覆盖输入的每个"
-    " unit_id 且仅一次：无关时只输出 {unit_id,operation:\"retain\"}；相关时输出"
-    " {unit_id,operation:\"update\",core}。core 与 new_units 每项必须包含且仅包含"
-    " behavior_pattern、preference_summary、representative_behavior_indices、"
-    "preferred_entities、temporal_activity；behavior_pattern 必须逐字复制输入已有"
-    " tag，禁止 taxonomy:: 前缀、层级后缀或复合标签。新行为 index 只能被一个"
-    " update、新 unit 或 unmatched 使用一次；不得删除旧 unit 的已有支撑 index，"
-    "不得生成 timestamp。memory_delta 的每个 behavior_index 必须恰好有一个归属："
-    "被 update.core 或 new_units 的 representative_behavior_indices 引用，或列入"
-    " unmatched_behavior_indices。retain 不消费任何新行为；不能全部 retain 后"
-    "省略 delta。无法有依据地综合的行为也必须保留在 unmatched 中，不能静默丢弃。"
-    "update 应根据旧单元和相关新增原文更新当前目标、纠正和任务状态；"
-    "单次安排与暂时限制不能改写成永久偏好，已完成事项不能仍写成待办。"
-    "对已有单元的暂停、恢复、纠正和完成，更新那个单元，不另建新单元。"
-    "对照例（仅演示判断，不是本轮用户事实）：旧单元 A“学国际象棋残局”支撑 [1,2]，"
-    "旧单元 B“学日语发音”支撑 [3]；delta 中 4 是用户说“这两周没空下棋，残局先放一放”，"
-    "5 是助手举的一个残局例子，6 是用户说“想开始学变魔术”，7 是用户问“打印机卡纸怎么办”。"
-    "A 用 4 更新为“仍想学残局，近两周暂停”，支撑 [1,2,4]；B retain；6 与 A、B 都无关，"
-    "凭这一条新建单元，只记“想开始学变魔术”，支撑 [6]；7 只是一次提问、不是目标，"
-    "与 5 一起列入 unmatched。为暂停另建一个单元、把 A 改写成不再感兴趣、"
-    "因为只说了一次就不更新 A、把 6 并进 A、B，或为 7 新建单元，都是错的。"
-    "只有用户自己的表达进入 core：助手的建议、事实解释和演示样例既不是用户偏好，"
-    "也不是用户的自然行为，助手讲过不等于用户已掌握或认可；这类行为留在 unmatched。"
-    "例如旧 unit 的支撑为 [1,2]，delta 为 [3,4]：若用 3 更新该 unit，"
-    "其完整支撑必须是 [1,2,3]；若 4 未被其他单元使用，unmatched 必须是 [4]。"
-    "不能返回支撑 [3]，也不能同时将 3 放入 unmatched。更新后的摘要应保留"
-    "仍然成立的旧事实，并明确区分长期偏好和最新任务状态。new_units 的"
-    "每个新单元只能引用同一 tag 的 delta，该 tag 必须与 behavior_pattern 完全"
-    "一致；不同 tag 的行为不要合并为一个新单元。与已有单元无关的明确目标或用户纠正可以凭"
-    "单条原文建立新单元，只记录其明确内容；其他单条行为"
-    "不足以建立新模式，应留在 unmatched，或用于有语义关联的旧单元更新。"
+    "\"unmatched_behavior_indices\":[...]}。"
+    "updated_units 覆盖每个旧 unit_id 恰好一次：无关 {unit_id,operation:\"retain\"}；"
+    "相关 {unit_id,operation:\"update\",core}。core/new_units 仅含 "
+    "behavior_pattern、preference_summary、representative_behavior_indices、"
+    "preferred_entities、temporal_activity；behavior_pattern 逐字用输入 tag，"
+    "禁止 taxonomy::/后缀/复合标签。每个新 index 只能归属一个 update、新 unit 或 "
+    "unmatched；保留旧支撑 index；不生成 timestamp；不能全 retain 后省略 delta。"
+    "update 用相关原文刷新目标/纠正/任务状态；单次安排与暂时限制不是永久偏好；"
+    "已完成不作待办。暂停/恢复/纠正/完成更新原单元，不另建。只有用户原文进 core；"
+    "助手建议/解释/样例进 unmatched。update 支撑=旧支撑∪新引用 index。"
+    "new_units：同 tag 可凭明确目标/纠正单条建单元；其他单条或无关提问进 unmatched。"
 )
 _V6_TAG_SCHEMA = {
     "anyOf": [
@@ -511,6 +530,8 @@ _V6_TAG_SCHEMA = {
         },
     ]
 }
+# Duplicate indices are rejected by the memory validators. uniqueItems is not
+# sent: providers such as Dashscope reject that keyword on an array schema.
 _V6_MEMORY_CORE_SCHEMA = _strict_object(
     {
         "behavior_pattern": _V6_TAG_SCHEMA,
@@ -519,7 +540,6 @@ _V6_MEMORY_CORE_SCHEMA = _strict_object(
             "type": "array",
             "items": {"type": "integer", "minimum": 1},
             "minItems": 1,
-            "uniqueItems": True,
         },
         "preferred_entities": {
             "type": "array",
@@ -576,7 +596,6 @@ _V6_MEMORY_INCREMENTAL_RESPONSE_SCHEMA = _strict_object(
             "type": "array",
             "items": {"type": "integer", "minimum": 1},
             "minItems": 0,
-            "uniqueItems": True,
         },
     }
 )
@@ -838,29 +857,6 @@ def _v6_system_prompt(stage: str, supplied_prompt: str) -> str:
     return supplied_prompt
 
 
-def _v6_reasoning_effort(stage: str, *, model: str | None = None) -> str:
-    """Reserve reasoning for semantic generation, not exact offset copying."""
-
-    if stage == "v6_evidence_extractor":
-        if model == "deepseek-v4-flash-260425":
-            return "low"
-        return "minimal"
-    if stage == "rid_interest_distiller" and model == "deepseek-v4-1-flash-260910":
-        # Minimal still reasons on v4.1 Flash and selects as low does, sooner and
-        # steadier; on v4 Flash it turned thinking off and emptied the selection.
-        return "minimal"
-    if stage == "v6_global_interest_generator" and model == "deepseek-v4-1-flash-260910":
-        return "low"
-    if stage in {
-        "v6_recent_candidate_generator",
-        "v6_project_domain_candidate_generator",
-        "v6_project_continuation_generator",
-        "v6_global_interest_generator",
-    }:
-        return "medium"
-    return "low"
-
-
 def _v6_max_tokens(stage: str) -> int | None:
     """Cap the one answer that grows with its input, a scope's summaries, above provider defaults.
 
@@ -1033,10 +1029,6 @@ def build_v6_ark_stage_invoker(
         "receipt_sink": receipt_sink,
         "response_schema_for_stage": _v6_response_schema,
         "require_response_metadata": True,
-        "reasoning_effort_for_stage": lambda stage: _v6_reasoning_effort(
-            stage,
-            model=config.model,
-        ),
         "max_tokens_for_stage": _v6_max_tokens,
         "prompt_version_for_stage": _v6_prompt_version,
         "invocation_lineage_for_stage": _v6_provider_invocation_lineage,
@@ -1450,8 +1442,8 @@ def _hot_list_plan(plan: Mapping[str, Any], *, input_snapshot_id: str) -> dict[s
         "hot_list_evidence": {
             "candidate_id": candidate_id,
             "fetch_status": "success",
-            "source_url": search_page_url(entry.word),
-            "search_url": search_page_url(str(plan["primary_query"])),
+            "source_url": hot_list_open_url(entry, pull),
+            "search_url": hot_list_open_url(entry, pull),
             "source_kind": HOT_LIST_SOURCE_KIND,
             "publisher": (urlparse(pull.list_url).hostname or "").removeprefix("www."),
             "document_revision_id": document_revision_id,
@@ -1567,57 +1559,24 @@ def default_v6_source_classifier(url: str, _content: str) -> SourceAssessment:
 
 
 _SESSION_SUMMARY_PROMPT = """\
-Summarize every supplied completed session once. Echo session_id exactly and
-return only {"summaries":[{"session_id":"...","summary":"..."}]}. For a
-global request, preserve the specific interest subject expressed in the supplied
-messages and their language, but omit project names, paths, task names, locators, and artifact
-identifiers. For a project request, summarize only supplied messages. Do not
-replace a specific topic with a broad category and do not add or drop sessions.
-Preserve these distinctions in a concise summary: USER interests and lasting
-constraints; ASSISTANT-covered explanations or methods; remaining user questions;
-unknown outcomes. When the user asks to pause, stop or narrow what gets
-recommended, keep what is held back as the user scoped it: topics about a
-subject stay topics about that subject, not a shortened "subject recommendations"
-that reads as suggesting items of that kind. Example, not facts about this user:
-"吉他的话题先停到下个月" -> "用户要求吉他相关的话题停到下个月再推荐", not "用户暂停吉他推荐到下个月".
-assistant_answer is the visible response to that request, not
-evidence of the user's preferences, agreement, understanding or completed work. When the user
-says they still do not understand something or names what they find hard, keep
-that difficulty in the user's own words and say whether it is resolved is unknown,
-since explaining it again does not resolve it, unless a later user message says so.
-Mark unknown only what the user left open this way or an answer that is missing; do
-not add unknowns about satisfaction or whether a suggestion was taken. An assistant
-promise about what will happen next, such as resuming on its own, is the assistant's
-statement, not a choice the user made. Example, not facts about this user: "转调之后我就数不清拍子了"
-answered by counting one passage aloud -> "用户说转调后数不清拍子；助手带着数了一段，能否数清未知",
-not "助手讲解了转调后的数拍方法，用户已掌握".
-A null answer means unknown coverage: say the question was asked and its answer
-is missing; do not call the question still open and do not add a follow-up.
-Write each summary in the language of that session's user messages.
-Example, not facts about this user: the user asked "国际象棋快棋里加秒和延时有什么不同？"
-and assistant_answer is null -> "用户问国际象棋快棋里加秒和延时的区别；回答缺失，覆盖未知。"
-Not "…尚未得到回答，问题仍然存在", not "…后续可补充对比", and not an English summary.
-Keep the concrete subject and the substance of what was explained so later
-questions can offer something new. For assisted input, describe discussion
-coverage only; do not infer a new user interest.
+Summarize each supplied completed session once. Decide quickly; JSON only:
+{"summaries":[{"session_id":"...","summary":"..."}]}. Echo session_id exactly;
+do not add or drop sessions.
+
+Global: keep the specific subject and language of the user messages; omit
+project names, paths, task names, locators and artifact ids. Project: only the
+supplied messages. Keep concise distinctions: USER interests and lasting
+constraints; ASSISTANT explanations; remaining user questions; unknown outcomes.
+Pause/stop/narrow recommendation: preserve the user's scoped subject wording.
+assistant_answer is not proof of preference, agreement or mastery. Unresolved
+user difficulty stays in their words with resolution unknown. Null answer =
+question asked, answer missing — do not call it still open or invent follow-ups.
+Assistant promises about next steps are not user choices. Assisted input:
+coverage only, no new inferred interest. Write each summary in the session's
+user language; keep the concrete subject so later cards can ask something new.
 """
-_PA_PROMPT = """\
-Return zero to eight highest-compatible fixed starter hits for the supplied
-ranked interests. Use at most one hit for each unique starter ID and do not
-force a full interest-by-category matrix. When viable, cover both
-adjacent_explanation and broad_timely_practical across the returned set.
-Match the user's current goal and explicit constraints in each interest summary.
-Reject a starter that requires an activity the user has paused or ruled out now;
-historical topical similarity alone is insufficient. Read discussion_coverage:
-choose a question that adds an explanation, comparison or useful application beyond
-what was already answered. An assistant suggestion does not establish an interest.
-For example, after a camera exposure explanation, a relevant question about motion
-blur may add a new practical distinction; a second exposure definition does not.
-Select only suitable supplied IDs; return fewer hits when the corpus lacks one.
-Return only
-{"hits":[{"starter_id":"...","interest_summary_id":"..."}]}. Use input IDs
-only and do not return or rewrite starter text.
-"""
+# Legacy PA fixed-retriever prompt removed: generate never called that stage.
+# Receipt / lineage identities for older pools remain in topic_product.
 _RECENT_PROMPT = """\
 Plan zero to four searches for recent progress related to the supplied interests,
 with at most one candidate per interest. Return fewer or no candidates when
@@ -1805,37 +1764,20 @@ async def _invoke_v6_ark_evidence_selector(
 
 
 _HOT_NEWS_MATCHER_PROMPT = """\
-为全局新建页的资讯卡，从 hot_list 里选恰好一条热搜。
+为全局新建页从 hot_list 选恰好一条热搜。快速决定，只返回 JSON。
 
-按顺序判断：
-1. 先核对 interests 中的当前意愿和范围。用户明确暂停、停止推荐或要求条件满足后再推荐的主题，
-   在输入没有恢复依据时，与该主题相关的热搜在 matched 和 closest 中都不能选。
-   长期兴趣仍在或 interest_summary_id 为 null，都不解除这项限制。
-   只暂停活动但明确允许讨论时，按允许范围选择；同一来源摘要中的其他兴趣仍可选择。
-   例如「买邮票先停，发行资讯可以聊」允许选择新邮发行热搜；「集邮话题先不推」则不选它，
-   不得改标 closest 来绕过暂停，应从其余主题中选择。
-2. interests 是用户画像里的兴趣。逐条读 hot_list 的 title（有 summary 时一并读），
-   找讲的正是某条兴趣所关心的具体事物的热搜：有这条兴趣的用户点开它，读到的是与自己关心的事直接相关的新情况。
-   只是字面沾边、同属一个大类，或要绕几步才联系得上的，都不算。
-3. 有这样的热搜时，选其中与兴趣联系最直接的一条：match 为 matched，interest_summary_id 写那条兴趣。
-4. 一条都没有时，选与这些兴趣关系最近的一条：match 为 closest，interest_summary_id 为 null。
-   hot_list 按热度排列，排在前面不等于更相关；热度不是选择理由。
-5. news_query 用来在新闻搜索里找这件事的报道：两到五个词，用热搜的语言写出事件的主体和事情本身，
-   不加日期、版本号、引号、运算符或站点限定，也不写用户的兴趣或任何个人信息。
-6. matched 的 direction 写用户本来关心的具体方向，不按热搜事件或卡片的新知识点命名。
-   同一兴趣摘要可能含多个方向，interest_summary_id 是来源，不表示这些方向全部相同。
-   同一方向有 direction_feedback 标签时逐字复用；其中 hidden 或 permanent 的方向不能 matched，reduced 可以。
-   closest 的 direction 为 null，不能给最接近的兴趣计入一次方向反馈。
+1. 用户明确暂停/停止推荐或条件未满足前勿推的主题，matched 与 closest 都不能选相关热搜；
+   长期兴趣仍在或 interest_summary_id 为 null 也不解除。只暂停活动但允许讨论时，按允许范围选。
+2. 读 interests 与 hot_list 的 title/summary，找直接讲某条兴趣所关心事物的热搜；
+   字面沾边、同大类或需绕几步关联都不算 matched。
+3. 有则选联系最直接的一条：match=matched，interest_summary_id=该兴趣。
+4. 否则选关系最近的一条：match=closest，interest_summary_id=null。热度排序不是理由。
+5. news_query：2–5 词，写事件主体与事情，不加日期/引号/运算符/站点/个人信息。
+6. matched 的 direction 用用户原方向名（有 direction_feedback 则逐字复用）；
+   hidden/permanent 不可 matched；closest 的 direction 为 null。
 
-对照示例（仅演示判断，不是本轮用户事实）：
-- 兴趣“收集各地的老邮票”。热搜有“某综艺定档”（排在最前）和“新版生肖邮票今日发行”：
-  后者 matched 这条兴趣，检索词“生肖邮票 发行”。
-- 兴趣“学拉坯做陶艺”“养热带鱼”。热搜有“某综艺定档”（排在最前）、“春运火车票今日开售”、“博物馆新展宋代瓷器”：
-  没有一条讲的是拉坯或养鱼本身，都不算 matched；“博物馆新展宋代瓷器”离陶艺最近，选它，closest、兴趣为 null，
-  检索词“宋代瓷器 新展”。只因排在最前就选“某综艺定档”，或把瓷器展说成 matched，都是错的。
-
-只返回 {"hot_entry_id":"...","interest_summary_id":"..." 或 null,"match":"matched|closest","news_query":"...","direction":"..." 或 null}。
-hot_entry_id、interest_summary_id 只能逐字取自输入。
+只返回 {"hot_entry_id":"...","interest_summary_id":"..." 或 null,"match":"matched|closest",
+"news_query":"...","direction":"..." 或 null}。ID 只能逐字取自输入。
 """
 _UTILITY_PROMPT = """\
 Judge optional questions on the user's new-conversation page. Clicking sends the
@@ -2176,102 +2118,33 @@ candidate_slots 里每个 slot_id 恰好出现一次；decision 为 write 时 so
 
 
 _GLOBAL_INTEREST_PROMPT = """\
-为全局新建页生成用户愿意主动点开的问题，candidate_slots 里每个槽至多一条。
+为全局新建页生成用户愿意点开的问题；每个 candidate_slot 至多一条。快速决定，只返回 JSON。
 
-direction 只写用户自身兴趣的具体主题，取用户原兴趣里的简短对象名称，不写本题新增的知识点、收益或进度。
-一条摘要可能同时含几种兴趣：不同兴趣分别命名，同一兴趣的不同知识点原样复用同一个 direction。
-direction_feedback 记着已有方向：主题相同时原样复用其 direction，不另起同义名称。
-negative_preferences 只否定其中的具体方向，source_id/source_event_ids 是来源，不否定同一来源中的其他兴趣。
-direction_feedback 的 hidden/permanent 方向不出题；reduced 方向沿下面的降频规则选新角度。
+direction：用户原兴趣里的短对象名，不写新知识点/收益/进度。不同兴趣分别命名；同兴趣复用同名。
+direction_feedback 主题相同时逐字复用。negative_preferences 只否其 direction_anchor。
+hidden/permanent 方向不出题；reduced 仅在明显不同角度时出。
 
-按顺序完成：
-1. 从 ranked_interests 读出用户真正关心的具体事物。interest_summary 是长期画像里的一条兴趣或一次已完成会话的摘要，
-   不是本轮对话；discussion_coverage 说明这些兴趣下已经聊过什么。
-   用户原话确定关注对象、已表达的目标、真实条件和限制，不是可推荐知识点的穷举清单。
-   可以围绕同一对象提出用户未提过的属性、结构、过程或判断技巧，只要它直接帮助理解该对象或实现已表达的目标。
-   具体条件只在确实影响本题时使用，不要求每题重复这些条件。
-   用户当时要求的回复篇幅或比较形式，不自动成为后续推荐的固定题型；只有明确持续的限制才沿用。
-   原兴趣涉及多个对象时，可以独立介绍其中一个对象的知识，不要求每题重复同一比较。
-   不得为了关联新知识而虚构用户的新目标、新观察或已采取的行动；与旧题重复的判断保持不变。
-   例如用户想了解陶瓷杯的材料特性，已经聊过杯壁厚度与保温：
-   “陶瓷杯的釉面和坯体各起什么作用？”直接解释同一对象的材料结构，可以推荐；
-   “开咖啡店该采购多少陶瓷杯？”凭空增加经营和采购需求，不推荐。
-   兴趣分两类：想把一件事做成的，和只是想弄懂一个现象的。两类都要出题，做事类不优先。
-   兴趣里记着“等用户先定下A，再讨论B”时，A 是用户自己要先完成的事，B 要等 A 完成才谈：两者都不替用户出题，
-   除非用户请助手帮忙做 A；同一句里没有条件的事项照常可以出题。已经完成或不再需要的事不写成进行中。
-2. 为这条兴趣找出尚未讲清的知识、机制、判断方法或取舍。
-   从相同目标的互补知识、现象背后的机制、有意义的比较、方法迁移中选一个自然联系。
-   discussion_coverage 里助手给过的做法和说法未经验证：可以问它在什么条件下成立、与别的做法怎么取舍，
-   不问它“为什么/如何起效”。
-   intent 前半句只写兴趣里用户提到的对象，不写用户的进度、状态或想法；
-   后半句写点开后能学会、分辨或改善什么，新角度只写在这里。
-   只想弄懂现象的兴趣，收获就是理解本身，不要转写成任务、计划或工具推荐。
-   准备、执行、记录、整理属于同一操作流程，换到下一步本身不算新的话题价值。
-   already_offered 与 dismissed_questions 里的题只作去重背景，不作为用户事实或兴趣来源。
-   比较旧题完整作答会包含什么：其中必需的机制、条件、后果或子问题已被旧题覆盖。
-   把旧题拆小、点名解释因素、把“权衡”改成“影响机制”，或重述用户原条件，都不是新角度。
-   new_angle 要指出解决旧题所必需的主解释之外的新知识，不能只说问法或范围不同。
-   能找到最接近的旧题，不代表新题重复：相同对象、条件、共同背景或可选拓展本身不算覆盖。
-   只有旧题的必需核心答案已经回答了拟问的问题才跳过；不要把旧题可能顺带展开的一切都算作已问。
-   already_offered 是这条兴趣已经在推荐里、用户还没点开的题；换个说法问同一件事不算新话题，
-   换一个确实不同的角度，或者跳过这条兴趣。
-   每个槽先写 direction（这条兴趣里用户自己的具体主题，与 direction_feedback 主题相同时逐字复用其名称），
-   再写 blocked_by：在 direction_feedback 里找同名方向，状态为 hidden 或 permanent 时照抄“方向名：状态”；
-   该角度与 negative_preferences 里被否定的题是同一个问题，或是 discussion_coverage 里用户要求暂停、之后没有恢复的事项时，照抄那条记录的要点；
-   都不是时写“无”。blocked_by 不是“无”时，decision 写 skip，不改写成同一方向的别的问法。
-   reduced 方向不算阻止，但只有与常见问法明显不同的角度才写。
-   先写 new_angle：从用户原始兴趣重新选一个尚未涉及的独立知识点，说明点开能学到什么，最多60字。
-   不把上一道推荐题当成待续写的对话，也不先选旧题再围绕它找新措辞。
-   旧题涉及的主解释已很多时，跨到同一对象尚未涉及的属性、现象、判断技巧或有意义的比较；仍须与用户兴趣直接相关。
-   new_angle 选定前先排除 discussion_coverage、already_offered、dismissed_questions 已经问过的核心问题；
-   换措辞、问法、例子或版本名不算新角度。之后的评分会逐题核对这些集合，这里不逐项写出最接近的旧题，
-   也不因为能找到相近的旧题就跳过：写下这个独立知识点后直接写 write。
-   只有 blocked_by 不是“无”，或这条兴趣确实想不出任何独立知识点时才 skip。
-   位置不够时，先给 already_offered 里没有的兴趣的槽写题。
-   例如兴趣“学变魔术”，已答过扑克牌假洗的手法：“假洗怎么练得更自然？”与它是同一件事，不选这个角度；
-   “表演时怎样把观众的视线从另一只手上引开？”的 new_angle 写“视线引导的原理，前面没讲到”，write。
-   feedback_status 为 reduced 的兴趣，用户不久前对它的题点过“不感兴趣”：只在能换一个与常见问法明显不同的角度时出题，
-   想不出就跳过它。例如兴趣“学变魔术”为 reduced：“新手先练哪个扑克牌魔术？”仍是常见问法，不出；
-   “魔术师怎样把观众的视线从另一只手上引开？”换到视线如何被引开的原理，可以出。
-3. 写出无需历史也能读懂的完整问题：明确具体对象，说清要理解的现象或区别。
-   title 是用户向助手提出的问题，不是助手问用户“想不想让我帮你”。
-   各条题的收获彼此不同。同一兴趣有多个槽时，分别选不同且尚未回答的机制、条件、比较或取舍，
-   不把同一个问题拆成几条或换说法；想不出新收获时跳过该槽，不改写成别的兴趣的题。
-   page_demand 说明这一批最多备几张（首屏只展示一部分，用户点开或不感兴趣后由其余的依次补上）、
-   上一轮带回来的卡占了几个位置、还空着几个位置。先按上面的标准逐条判断能不能出题，
-   再看还空几个位置：位置空着是可接受的结果，不是放宽标准的理由，
-   也不要为了填满而把两条兴趣写成相近的题。
-   位置不够给每条能出题的兴趣时，先给 already_offered 里没有的兴趣出题。
-
-对照示例（仅演示判断，不是本轮用户事实）：
-- 兴趣是“看国际象棋顶级比赛”，已聊过开局为什么常走同一套变化。
-  “怎么安排下次观赛？”把理解型兴趣转成任务；“如何整理观赛笔记？”只是流程延伸；
-  “人工智能会怎样改变整个棋界？”跳出用户实际看到的对象，跳跃过远。
-  “为什么顶尖棋手之间的对局平局特别多？”仍落在这条兴趣的对象上，给出能直接读懂的机制。
-- 兴趣是“自己给自行车换内胎”，已经学会换内胎的步骤。
-  “怎么换内胎？”重复已答；“换完胎怎么收纳工具？”只延续操作；
-  “职业车队怎么挑比赛轮组？”跳到用户没有的需求，跳跃过远。
-  “补胎和直接换内胎各适合什么情况？”比较两种做法的代价，有判断价值。
-- 兴趣是“自学吉他”，助手说过“每天练十分钟指法就够了”。
-  “为什么每天十分钟指法练习就够？”把助手的说法当成事实；“练习时长和练习方式各怎样影响指法进步？”问条件，有判断价值。
-- 兴趣是“练书法”，用户说换不换毛笔得看最后临哪本帖，眼下只想知道写字时手腕为什么老是抖。
-  “手腕发抖时，握笔高低和悬腕方式各有什么影响？”回应没有条件的事项；
-  “欧体和颜体字帖各适合什么人？”替用户调查他要自己先定的事；“入门毛笔怎么挑？”条件还没成立。
-- 兴趣是“学日语发音”，用户说仍听不出长音和短音：用几组成对的词做一次听辨帮助理解，重复规则无益。
-  若用户暂停整个主题，则不推荐；只暂停某项操作，不扩大成否定整个兴趣。
-
-这些卡生成时没有取证核实，需要近期事实的问题由近期进展另行生成：
-不要写需要最新版本、近期发布、当前价格、今日天气这类外部事实才能回答的问题。
-不确定现象是否成立时，问影响因素或成立条件，不把猜测写成既定事实。
-“为什么”仍在断言现象存在：没有观察记录，不得假定某地每年都发生同一规律。
-保留原话的持续约束：不买设备、不改文件、等待批准、明确暂停等。
-按用户原话的语言写，每题最多60字符；中文问句以“？”结尾，技术名称可保留英文。
+1. 从 ranked_interests 读用户真正关心的具体事物（画像或已完成会话摘要，不是本轮对话）。
+   discussion_coverage 是已聊内容。可围绕同一对象问未提过的属性/机制/判断技巧，直接服务该对象或已表达目标。
+   不虚构新目标/观察/行动。做事类与理解类都出题，做事不优先。
+   “先定 A 再谈 B”：除非用户请助手做 A，否则 A/B 都不替用户出题；无条件事项照常可出。
+2. 找尚未讲清的知识/机制/判断/取舍。助手说法未经验证：可问成立条件或取舍，不问“为何起效”。
+   intent：前半用户对象，后半点开能学会/分辨/改善什么。理解型兴趣不要改成任务/工具推荐。
+   同流程下一步不算新话题。already_offered / dismissed_questions 只去重。
+   旧题必需核心答案已覆盖则 skip；换措辞/拆小/改问法不算新角度。
+   每槽写 direction，再写 blocked_by（hidden/permanent/暂停/负反馈要点，否则“无”）。
+   blocked_by≠“无”则 skip。否则写 new_angle（≤60字独立知识点）后 write。
+   想不出知识点才 skip。位置不够时先给 already_offered 没有的兴趣写题。
+   reduced：仅明显不同于常见问法时出，否则 skip。
+3. title：无需历史也能读懂的用户向助手提问（非“要不要我帮你”），≤60字符，用户语言，中文以“？”结尾。
+   同兴趣多槽须不同收获；空位可留，不为填满放宽标准。
+不要写需最新版本/价格/今日天气等外部事实的题；不确定时问条件，不把猜测当事。
+保留用户持续约束（暂停、不买设备等）。
 
 只返回 {"candidates":[{"slot_id":"...","interest_summary_id":"...","positions_left":1,
-"direction":"...","blocked_by":"无","new_angle":"...",
-"decision":"write","intent":"...","title":"..."}]}。
-candidate_slots 里每个 slot_id 恰好出现一次，interest_summary_id 必须是该 slot_id 对应的兴趣。
-decision 为 write 的槽数不超过 page_demand 里还空着的位置数；decision 为 skip 时 direction、intent、title 写空字符串。
+"direction":"...","blocked_by":"无","new_angle":"...","decision":"write","intent":"...","title":"..."}]}。
+每个 slot_id 恰好一次；interest_summary_id 须对应该槽兴趣。
+write 数≤page_demand 空位；skip 时 direction/intent/title 为空字符串。
 """
 
 
@@ -2489,9 +2362,7 @@ class V6SourceMessage:
 
     @property
     def natural(self) -> bool:
-        return (
-            self.input_origin == "manual_free_text" and self.assistance_origin == "none"
-        )
+        return is_user_revisit_eligible(self.input_origin, self.assistance_origin)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2499,6 +2370,7 @@ class V6ContextSnapshot:
     state: dict[str, Any]
     context_scope: str
     project_id: str | None
+    work_mode: str
     messages: tuple[V6SourceMessage, ...]
     delta_event_ids: tuple[str, ...]
     short_intent_state: ShortIntentState
@@ -2712,13 +2584,17 @@ def _session_summary_materialization_receipt(
 ) -> dict[str, Any]:
     summary_ids = [summary.session_summary_id for summary in summaries]
     generated = list(generated_summary_ids)
+    generated_set = set(generated)
+    # Reused summaries keep the provenance of the call that wrote them; only
+    # summaries minted in this run must carry the current config version.
     _rejected3 = (
-        len(generated) != len(set(generated))
-        or not set(generated).issubset(summary_ids)
+        len(generated) != len(generated_set)
+        or not generated_set.issubset(summary_ids)
         or not summary_config_version
         or any(
             summary.summary_config_version != summary_config_version
             for summary in summaries
+            if summary.session_summary_id in generated_set
         )
     )
     if (
@@ -2727,7 +2603,6 @@ def _session_summary_materialization_receipt(
         raise TerminalGenerationRejection(
             "session_summary_materialization_contract_failed"
         )
-    generated_set = set(generated)
     return {
         "schema_version": SESSION_SUMMARY_MATERIALIZATION_RECEIPT_VERSION,
         "input_snapshot_id": snapshot.input_snapshot_id,
@@ -2806,6 +2681,12 @@ def _scope_matches(project_id: str | None, context_scope: str) -> bool:
     if context_scope == GLOBAL_NEW_CHAT_SCOPE:
         return str(project_id or "") in GLOBAL_PROJECT_BUCKETS
     return str(project_id or "") == context_scope.removeprefix("project:")
+
+
+def _work_mode_matches(session_work_mode: Any, work_mode: str) -> bool:
+    return normalize_topic_work_mode(session_work_mode) == normalize_topic_work_mode(
+        work_mode
+    )
 
 
 def _short_trigger_evidence_event_ids(
@@ -3006,11 +2887,10 @@ def _latest_session_summaries(
 ) -> dict[str, Mapping[str, Any]]:
     """The newest stored summary in a scope of each of the given sessions.
 
-    A summary configuration upgrade rewrites a session at the same completion
-    boundary, and a turn that completes while the shared state is prepared
-    leaves a summary of that boundary without it; at such a tie the summary
-    written under the current configuration version, then the one covering
-    more turns, is read.
+    Summaries are content-keyed: a model or prompt-config change does not force
+    a rewrite. When several rows share a completion boundary (legacy digests),
+    prefer the one whose config version matches the current schema prefix, then
+    the one covering more turns.
     """
 
     latest: dict[str, Mapping[str, Any]] = {}
@@ -3369,7 +3249,10 @@ def _rid_decision_context(
                 "age_seconds": max(0.0, decision_time - item.observed_at),
                 "intent_cluster": item.intent_cluster,
                 "action_type": item.action_type,
-                "content": item.content,
+                "content": _clip_summary_text(
+                    item.content, _RID_FEEDBACK_MESSAGE_CHARS
+                )
+                or "",
             }
             for item in recent_natural
         ],
@@ -3397,6 +3280,552 @@ def _message_from_behavior(
         action_type=str(mapping.get("action_type") or "natural_question"),
         project_id=project_id,
     )
+
+
+def _summary_origins(
+    messages: Sequence[V6SourceMessage],
+) -> tuple[str, str]:
+    input_origins = tuple(dict.fromkeys(item.input_origin for item in messages))
+    assistance_origins = tuple(
+        dict.fromkeys(item.assistance_origin for item in messages)
+    )
+    # Hand-typed and prompt-suggestion turns are equivalent for RID. When a
+    # session mixes only those, project a single eligible pair instead of
+    # "mixed" so natural_revisit_eligible stays true.
+    if messages and all(
+        is_user_revisit_eligible(item.input_origin, item.assistance_origin)
+        for item in messages
+    ):
+        if len(input_origins) == 1 and len(assistance_origins) == 1:
+            return input_origins[0], assistance_origins[0]
+        return "manual_free_text", "none"
+    return (
+        input_origins[0] if len(input_origins) == 1 else "mixed",
+        assistance_origins[0] if len(assistance_origins) == 1 else "mixed",
+    )
+
+
+def _summary_abstract_context(
+    messages: Sequence[V6SourceMessage],
+) -> list[str]:
+    clusters = list(
+        dict.fromkeys(
+            item.intent_cluster
+            for item in messages
+            if item.intent_cluster and item.intent_cluster != "unmapped"
+        )
+    )
+    return clusters or ["general_interest"]
+
+
+def _select_summary_turns(
+    turns: Sequence[tuple[Any, str, str | None]],
+) -> list[tuple[Any, str, str | None]]:
+    """Newest turns inside the summary budget, returned in their original order.
+
+    ``turns`` is oldest-first. The first kept turn is kept even when it alone
+    exceeds the character budget; later turns stop at the turn count or the
+    budget. Text is clipped the same way the model request clips it.
+    """
+
+    kept: list[tuple[Any, str, str | None]] = []
+    used = 0
+    for payload, content, answer in reversed(tuple(turns)):
+        clipped_content = _clip_summary_text(content, _SUMMARY_MAX_USER_CHARS) or ""
+        clipped_answer = _clip_summary_text(answer, _SUMMARY_MAX_ANSWER_CHARS)
+        cost = len(clipped_content) + len(clipped_answer or "")
+        if kept and (
+            len(kept) >= _SUMMARY_MAX_TURNS_PER_SESSION
+            or used + cost > _SUMMARY_MAX_SESSION_CHARS
+        ):
+            break
+        kept.append((payload, clipped_content, clipped_answer))
+        used += cost
+    kept.reverse()
+    return kept
+
+
+def _summary_coverage_ids(messages: Sequence[V6SourceMessage]) -> set[str]:
+    """Turns a summary of these messages is accountable for."""
+
+    ordered = sorted(messages, key=lambda item: item.ordinal)
+    selected = _select_summary_turns(
+        [(message, message.content, message.assistant_answer) for message in ordered]
+    )
+    return {message.event_id for message, _, _ in selected}
+
+
+def _session_identity_payload(
+    session_id: str,
+    messages: Sequence[V6SourceMessage],
+) -> dict[str, Any]:
+    """The bounded turns the summary covers. A new turn inside that window changes the digest."""
+
+    ordered = sorted(messages, key=lambda item: item.ordinal)
+    selected = _select_summary_turns(
+        [(message, message.content, message.assistant_answer) for message in ordered]
+    )
+    covered = [message for message, _, _ in selected]
+    input_origin, assistance_origin = _summary_origins(messages)
+    return {
+        "session_id": session_id,
+        "abstract_context": _summary_abstract_context(covered),
+        "interaction_pattern": [message.action_type for message in covered],
+        "input_origin": input_origin,
+        "assistance_origin": assistance_origin,
+        "messages": [
+            {
+                "event_id": message.event_id,
+                "ordinal": message.ordinal,
+                "request_id": message.request_id,
+                "role": "user",
+                "content": content,
+                "assistant_answer": answer,
+                "assistance_origin": message.assistance_origin,
+            }
+            for message, content, answer in selected
+        ],
+    }
+
+
+def _session_summary_content_identity(
+    *,
+    context_scope: str,
+    session_payload: Mapping[str, Any],
+    source_event_ids: Sequence[str],
+    source_locators: Sequence[SessionSourceLocator],
+    completion_boundary: SessionCompletionBoundary,
+) -> dict[str, Any]:
+    """Content-only identity: conversation coverage, not summarizer model/config."""
+
+    return {
+        "context_scope": context_scope,
+        "session": session_payload,
+        "source_event_ids": list(source_event_ids),
+        "source_locators": [item.as_payload() for item in source_locators],
+        "completion_boundary": completion_boundary.as_payload(),
+    }
+
+
+def _session_summary_content_digest(identity: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _session_summary_content_matches(
+    artifact: SessionSummaryArtifact,
+    *,
+    session_id: str,
+    context_scope: str,
+    input_origin: str,
+    assistance_origin: str,
+    source_event_ids: Sequence[str],
+    source_locators: Sequence[SessionSourceLocator],
+    completion_boundary: SessionCompletionBoundary,
+    completed_at: float,
+) -> bool:
+    return (
+        artifact.session_id == session_id
+        and artifact.context_scope == context_scope
+        and artifact.input_origin == input_origin
+        and artifact.assistance_origin == assistance_origin
+        and artifact.source_event_ids == tuple(source_event_ids)
+        and artifact.source_locators == tuple(source_locators)
+        and artifact.completion_boundary == completion_boundary
+        and float(artifact.completed_at) == float(completed_at)
+    )
+
+
+def _clip_summary_text(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - len(_SUMMARY_TRUNCATION_MARKER))] + _SUMMARY_TRUNCATION_MARKER
+
+
+def _bounded_summary_turns(
+    messages: Sequence[V6SourceMessage],
+) -> list[tuple[V6SourceMessage, str, str | None]]:
+    """The summary input and the turns that input is accountable for."""
+
+    ordered = sorted(messages, key=lambda item: item.ordinal)
+    return _select_summary_turns(
+        [(message, message.content, message.assistant_answer) for message in ordered]
+    )
+
+
+def _session_model_payload(
+    session_id: str,
+    messages: Sequence[V6SourceMessage],
+) -> dict[str, Any]:
+    """Newest turns only, clipped: what the summarizer is asked to read."""
+
+    input_origin, assistance_origin = _summary_origins(messages)
+    bounded = _bounded_summary_turns(messages)
+    return {
+        "session_id": session_id,
+        # Counts tell an audit how many turns the session had and how many
+        # the summary was written from.
+        "source_turn_count": len(messages),
+        "supplied_turn_count": len(bounded),
+        "abstract_context": _summary_abstract_context(
+            [message for message, _, _ in bounded]
+        ),
+        "interaction_pattern": [
+            message.action_type for message, _, _ in bounded
+        ],
+        "input_origin": input_origin,
+        "assistance_origin": assistance_origin,
+        "messages": [
+            {
+                "event_id": message.event_id,
+                "ordinal": message.ordinal,
+                "request_id": message.request_id,
+                "role": "user",
+                "content": content,
+                "assistant_answer": answer,
+                "assistance_origin": message.assistance_origin,
+            }
+            for message, content, answer in bounded
+        ],
+    }
+
+
+def _summary_request_payload(
+    input_snapshot_id: str,
+    context_scope: str,
+    sessions: Sequence[Mapping[str, Any]],
+    *,
+    request_id: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "input_snapshot_id": input_snapshot_id,
+            "request_id": request_id or f"v6-session-summary-{'0' * 32}",
+            "context_scope": context_scope,
+            "summary_input_policy": _SUMMARY_INPUT_POLICY_VERSION,
+            "sessions": list(sessions),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _summary_batch_estimate(
+    counter: history.StageTokenCounter,
+    snapshot: "V6ContextSnapshot",
+    sessions: Sequence[Mapping[str, Any]],
+    *,
+    reserved_output: int,
+) -> int:
+    return counter.estimate_stage_tokens(
+        _SESSION_SUMMARY_PROMPT,
+        _summary_request_payload(
+            snapshot.input_snapshot_id,
+            snapshot.context_scope,
+            sessions,
+        ),
+        reserved_output,
+    )
+
+
+def _fit_summary_session(
+    payload: dict[str, Any],
+    *,
+    counter: history.StageTokenCounter,
+    snapshot: "V6ContextSnapshot",
+    limit: int,
+) -> dict[str, Any] | None:
+    """Drop the oldest turns until one session fits the context window."""
+
+    while True:
+        estimate = _summary_batch_estimate(
+            counter,
+            snapshot,
+            [payload],
+            reserved_output=(
+                _SUMMARY_BASE_RESERVED_OUTPUT_TOKENS
+                + _SUMMARY_RESERVED_OUTPUT_TOKENS
+            ),
+        )
+        if estimate <= limit:
+            return payload
+        messages = payload["messages"]
+        if len(messages) > 1:
+            payload = {
+                **payload,
+                "messages": messages[1:],
+                "interaction_pattern": payload["interaction_pattern"][1:],
+            }
+            continue
+        # One turn can still be too large for a small context window: keep
+        # halving it rather than failing a preparation that only needs a
+        # shorter excerpt.
+        message = dict(messages[0])
+        content = str(message.get("content") or "")
+        answer = str(message.get("assistant_answer") or "")
+        if len(content) <= 1 and len(answer) <= 1:
+            return None
+        message["content"] = content[: max(1, len(content) // 2)]
+        if answer:
+            message["assistant_answer"] = answer[: max(1, len(answer) // 2)]
+        payload = {**payload, "messages": [message]}
+
+
+def _plan_summary_batches(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    counter: history.StageTokenCounter,
+    snapshot: "V6ContextSnapshot",
+    limit: int,
+) -> list[list[int]] | None:
+    """Greedy whole-session batches under the summarizer's context budget."""
+
+    batches: list[list[int]] = []
+    current: list[int] = []
+    for position in range(len(payloads)):
+        candidate = current + [position]
+        estimate = _summary_batch_estimate(
+            counter,
+            snapshot,
+            [payloads[index] for index in candidate],
+            reserved_output=(
+                _SUMMARY_BASE_RESERVED_OUTPUT_TOKENS
+                + _SUMMARY_RESERVED_OUTPUT_TOKENS * len(candidate)
+            ),
+        )
+        if estimate <= limit:
+            current = candidate
+            continue
+        if not current:
+            return None
+        batches.append(current)
+        current = [position]
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _recent_summary_sessions(
+    grouped: Mapping[str, Sequence[V6SourceMessage]],
+    prefixes_by_session: Mapping[str, Any],
+    *,
+    delta_event_ids: Sequence[str],
+    now: float,
+) -> list[str]:
+    """Summarize only recent conversations, but always one carrying this run's delta."""
+
+    delta_ids = set(delta_event_ids)
+    mandatory = {
+        session_id
+        for session_id, messages in grouped.items()
+        if any(message.event_id in delta_ids for message in messages)
+    }
+    cutoff = now - _SUMMARY_SESSION_WINDOW_SECONDS
+    recent = [
+        session_id
+        for session_id in grouped
+        if float(prefixes_by_session[session_id].boundary.completed_at) >= cutoff
+    ]
+    recent.sort(
+        key=lambda session_id: (
+            -float(prefixes_by_session[session_id].boundary.completed_at),
+            session_id,
+        )
+    )
+    return sorted(set(recent[:_SUMMARY_SESSION_LIMIT]) | mandatory)
+
+
+def _recent_rid_summaries(
+    summaries: Sequence[SessionSummaryArtifact],
+    *,
+    required_ids: Iterable[str],
+) -> tuple[SessionSummaryArtifact, ...]:
+    """Newest summaries for RID, keeping every summary the short delta requires."""
+
+    if len(summaries) <= _RID_SESSION_SUMMARY_LIMIT:
+        return tuple(summaries)
+    required = {str(item) for item in required_ids}
+    kept = [item for item in summaries if item.session_summary_id in required]
+    room = max(0, _RID_SESSION_SUMMARY_LIMIT - len(kept))
+    rest = sorted(
+        (item for item in summaries if item.session_summary_id not in required),
+        key=lambda item: (-float(item.completed_at), item.session_summary_id),
+    )
+    return tuple(kept + rest[:room])
+
+
+def _rid_request_estimate_payload(rid_inputs: Mapping[str, Any]) -> str:
+    """The serialized RID request, for its context-window preflight."""
+
+    binding = rid_inputs["binding"]
+    binding_payload = (
+        binding.as_provenance()
+        if hasattr(binding, "as_provenance")
+        else binding
+    )
+    return json.dumps(
+        {
+            "binding": binding_payload,
+            "input_snapshot_id": rid_inputs["input_snapshot_id"],
+            "user_profile": rid_inputs["user_profile"],
+            "long_term_profile_interests": [
+                interest.as_payload()
+                for interest in rid_inputs["long_term_profile_interests"]
+            ],
+            "session_summaries": [
+                summary.as_payload()
+                for summary in rid_inputs["session_summaries"]
+            ],
+            "activity_group": rid_inputs["activity_group"],
+            "threshold_version": rid_inputs["threshold_version"],
+            "feedback_context": rid_inputs["feedback_context"],
+            "prompt_version": RID_API_PROMPT_VERSION,
+            "delta": rid_inputs["delta"],
+            "decision_context": rid_inputs["decision_context"],
+            "request_id": f"v6-rid-{'0' * 32}",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _fit_rid_inputs_to_budget(
+    rid_inputs: dict[str, Any],
+    *,
+    counter: history.StageTokenCounter,
+    limit: int,
+    required_summary_ids: Iterable[str] = (),
+) -> bool:
+    """Drop oldest optional RID inputs until the one call fits.
+
+    Short-delta summaries stay until every optional summary is gone, then the
+    oldest required summary, then the oldest long-term profile interest. Returns
+    False only when the fixed envelope itself still exceeds ``limit``.
+    """
+
+    required = {str(item) for item in required_summary_ids}
+
+    def estimate() -> int:
+        return counter.estimate_stage_tokens(
+            _RID_API_SYSTEM_PROMPT,
+            _rid_request_estimate_payload(rid_inputs),
+            _RID_RESERVED_OUTPUT_TOKENS,
+        )
+
+    while True:
+        if estimate() <= limit:
+            return True
+        summaries = list(rid_inputs.get("session_summaries") or ())
+        droppable = sorted(
+            (
+                summary
+                for summary in summaries
+                if str(summary.session_summary_id) not in required
+            ),
+            key=lambda item: (float(item.completed_at), str(item.session_summary_id)),
+        )
+        if droppable:
+            drop_id = droppable[0].session_summary_id
+            rid_inputs["session_summaries"] = tuple(
+                summary
+                for summary in summaries
+                if summary.session_summary_id != drop_id
+            )
+            continue
+        if summaries:
+            oldest = min(
+                summaries,
+                key=lambda item: (float(item.completed_at), str(item.session_summary_id)),
+            )
+            rid_inputs["session_summaries"] = tuple(
+                summary
+                for summary in summaries
+                if summary.session_summary_id != oldest.session_summary_id
+            )
+            continue
+        interests = list(rid_inputs.get("long_term_profile_interests") or ())
+        if interests:
+            oldest_interest = min(
+                interests,
+                key=lambda item: (
+                    int(getattr(item, "profile_semantic_version", 0) or 0),
+                    str(item.interest_summary_id),
+                ),
+            )
+            rid_inputs["long_term_profile_interests"] = tuple(
+                interest
+                for interest in interests
+                if interest.interest_summary_id != oldest_interest.interest_summary_id
+            )
+            continue
+        return False
+
+
+def _recent_finalizer_estimate_payload(
+    *,
+    input_snapshot_id: str,
+    discussion_coverage: Any,
+    previously_offered: Any,
+    candidates: Sequence[Mapping[str, Any]],
+) -> str:
+    return json.dumps(
+        {
+            "input_snapshot_id": input_snapshot_id,
+            "discussion_coverage": discussion_coverage,
+            "previously_offered": previously_offered,
+            "candidates": list(candidates),
+            "request_id": f"v6-finalize-{'0' * 32}",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _fit_recent_finalizer_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    counter: history.StageTokenCounter,
+    limit: int,
+    input_snapshot_id: str,
+    discussion_coverage: Any,
+    previously_offered: Any,
+    reserved_output: int = 4096,
+) -> list[dict[str, Any]] | None:
+    """Drop trailing documents, then trailing candidates, until the call fits."""
+
+    fitted = [dict(item) for item in candidates]
+    for item in fitted:
+        item["documents"] = list(item.get("documents") or [])
+
+    def estimate(current: Sequence[Mapping[str, Any]]) -> int:
+        return counter.estimate_stage_tokens(
+            _RECENT_FINALIZER_PROMPT,
+            _recent_finalizer_estimate_payload(
+                input_snapshot_id=input_snapshot_id,
+                discussion_coverage=discussion_coverage,
+                previously_offered=previously_offered,
+                candidates=current,
+            ),
+            reserved_output,
+        )
+
+    while fitted:
+        if estimate(fitted) <= limit:
+            return fitted
+        last = fitted[-1]
+        documents = list(last.get("documents") or [])
+        if len(documents) > 1:
+            # Keep the first document as the lead; drop older extras from the tail.
+            last["documents"] = documents[:-1]
+            continue
+        fitted.pop()
+    return None
 
 
 def _completed_answers(
@@ -3436,10 +3865,12 @@ def _default_context_snapshot(
     store: TopicStarterStore,
     context_scope: str,
     *,
+    work_mode: str = DEFAULT_TOPIC_WORK_MODE,
     now: float,
     records_loader: RecordsLoader,
 ) -> V6ContextSnapshot:
     project_id = project_id_for_scope(context_scope)
+    normalized_work_mode = normalize_topic_work_mode(work_mode)
     records = records_loader()
     completed_prefix_by_session = {}
     for session_id, session_records in records.items():
@@ -3481,6 +3912,13 @@ def _default_context_snapshot(
     metadata, _ = get_all_sessions_metadata(limit=1_000_000, offset=0)
     project_by_session = {
         str(item.get("session_id") or ""): (str(item.get("project_id") or "") or None)
+        for item in metadata
+        if str(item.get("session_id") or "")
+    }
+    work_mode_by_session = {
+        str(item.get("session_id") or ""): normalize_topic_work_mode(
+            item.get("work_mode")
+        )
         for item in metadata
         if str(item.get("session_id") or "")
     }
@@ -3529,6 +3967,11 @@ def _default_context_snapshot(
         session_project_id = project_by_session.get(behavior.session_id)
         if not _scope_matches(session_project_id, context_scope):
             continue
+        if not _work_mode_matches(
+            work_mode_by_session.get(behavior.session_id),
+            normalized_work_mode,
+        ):
+            continue
         completed_prefix = completed_prefix_by_session.get(behavior.session_id)
         if (
             completed_prefix is None
@@ -3560,6 +4003,11 @@ def _default_context_snapshot(
     for session_id, completed_prefix in completed_prefix_by_session.items():
         session_project_id = project_by_session.get(session_id)
         if not _scope_matches(session_project_id, context_scope):
+            continue
+        if not _work_mode_matches(
+            work_mode_by_session.get(session_id),
+            normalized_work_mode,
+        ):
             continue
         session_records = records.get(session_id) or []
         for ordinal in completed_prefix.completed_user_ordinals:
@@ -3701,6 +4149,11 @@ def _default_context_snapshot(
             continue
         if not _scope_matches(project_by_session.get(item.session_id), context_scope):
             continue
+        if not _work_mode_matches(
+            work_mode_by_session.get(item.session_id),
+            normalized_work_mode,
+        ):
+            continue
         long_delta_event_ids.add(
             str(item.record_id or f"behavior:{item.behavior_index}")
         )
@@ -3725,16 +4178,27 @@ def _default_context_snapshot(
         if context_scope == GLOBAL_NEW_CHAT_SCOPE
         else ()
     )
+    completed_session_prefixes: list[CompletedSessionPrefix] = []
+    for session_id in sorted(completed_prefix_by_session):
+        if not _scope_matches(project_by_session.get(session_id), context_scope):
+            continue
+        if not _work_mode_matches(
+            work_mode_by_session.get(session_id), normalized_work_mode
+        ):
+            continue
+        completed_session_prefixes.append(completed_prefix_by_session[session_id])
     return V6ContextSnapshot(
         state=scoped_state,
         context_scope=context_scope,
         project_id=project_id,
+        work_mode=normalized_work_mode,
         messages=tuple(messages),
         delta_event_ids=delta_event_ids,
         short_intent_state=short_state,
         pending_short_intent_trigger_lineage=pending_lineage,
         input_snapshot_id=(
-            f"v6-input:{context_scope}:{profile_semantic_version}:"
+            f"v6-input:{context_scope}:{normalized_work_mode}:"
+            f"{profile_semantic_version}:"
             f"{short_state.short_intent_version}:{active_version}"
         ),
         profile_projection={
@@ -3771,11 +4235,7 @@ def _default_context_snapshot(
                 project_by_session=project_by_session,
             )
         ),
-        completed_session_prefixes=tuple(
-            completed_prefix_by_session[session_id]
-            for session_id in sorted(completed_prefix_by_session)
-            if _scope_matches(project_by_session.get(session_id), context_scope)
-        ),
+        completed_session_prefixes=tuple(completed_session_prefixes),
         state_maintenance_receipt=dict(state_receipt),
     )
 
@@ -3793,27 +4253,37 @@ def _news_only_successor(
     config: ArkBackgroundConfig,
     now: float,
 ) -> BackgroundGenerationResult:
-    """The predecessor pool with its news card replaced and every other card kept as written.
+    """Put the news card first; keep non-preset peers, drop presets and old news.
 
-    What served only the replaced news candidates (the report and the hot-list
-    fallback its match named) leaves with them: their grounding decisions,
-    evidence entries, external operations, component invocations and model
-    receipts and exclusive documents. Documents used by other candidates
-    stay in the snapshot. The new card's records take their place.
+    With a prior news lead, that card is replaced. Without one, the news card is
+    inserted at rank 1. Packaged cold-start cards never travel into the
+    successor: a preset-only predecessor becomes this one news card alone.
     """
 
     lead_id = news_lead_card_id(predecessor)
-    replaced = {lead_id}
-    for receipt in predecessor["ark_invocation_receipts"]:
-        if receipt["stage"] != "v6_hot_news_matcher":
+    replaced: set[str | None] = {lead_id} if lead_id else set()
+    for card in predecessor_cards:
+        if is_cold_start_card(card) or card_is_news(card):
+            replaced.add(str(card["card_id"]))
+    for receipt in predecessor.get("ark_invocation_receipts") or ():
+        if receipt.get("stage") != "v6_hot_news_matcher":
             continue
-        for candidate_id in receipt["lineage"]["candidate_ids"]:
+        for candidate_id in (receipt.get("lineage") or {}).get("candidate_ids") or ():
             replaced.add(str(candidate_id))
+
+    replaced_ids = {str(item) for item in replaced if item is not None}
 
     def kept(candidate_ids: Iterable[Any]) -> bool:
         ids = {str(value) for value in candidate_ids}
-        return not ids or not ids <= replaced
+        return not ids or not ids <= replaced_ids
 
+    kept_predecessor: list[Mapping[str, Any]] = []
+    for card in predecessor_cards:
+        if str(card["card_id"]) in replaced_ids:
+            continue
+        if is_cold_start_card(card) or card_is_news(card):
+            continue
+        kept_predecessor.append(card)
     news_id = str(news["candidate_id"])
     trigger_key = predecessor["generation_trigger_key"]
     evidence_receipt = news.get("evidence_receipt")
@@ -3821,18 +4291,19 @@ def _news_only_successor(
         RID_COMPONENT_ID: predecessor["component_receipts"][RID_COMPONENT_ID],
         UTILITY_COMPONENT_ID: utility_receipt.as_payload(),
     }
-    # A pool that was its news card alone used its utility judgment for that card
-    # only; the regular candidates it also judged never became cards.
-    news_only_predecessor = all(card["card_id"] == lead_id for card in predecessor_cards)
-    predecessor_utility_request_id = predecessor["component_receipts"][UTILITY_COMPONENT_ID]["request_id"]
+    # A pool that keeps no ordinary card used its utility judgment for news only.
+    news_only_predecessor = not kept_predecessor
+    predecessor_utility_request_id = (
+        (predecessor.get("component_receipts") or {}).get(UTILITY_COMPONENT_ID) or {}
+    ).get("request_id")
     invocations: list[dict[str, Any]] = []
-    for item in predecessor["component_invocation_receipts"]:
-        if not kept(item["candidate_ids"]):
+    for item in predecessor.get("component_invocation_receipts") or ():
+        if not kept(item.get("candidate_ids") or ()):
             continue
         news_only_utility = (
             news_only_predecessor
-            and item["component_id"] == UTILITY_COMPONENT_ID
-            and item["request_id"] == predecessor_utility_request_id
+            and item.get("component_id") == UTILITY_COMPONENT_ID
+            and item.get("request_id") == predecessor_utility_request_id
         )
         if news_only_utility:
             continue
@@ -3847,8 +4318,8 @@ def _news_only_successor(
         )
     ark_receipts = [
         dict(receipt)
-        for receipt in predecessor["ark_invocation_receipts"]
-        if kept(receipt["lineage"]["candidate_ids"])
+        for receipt in predecessor.get("ark_invocation_receipts") or ()
+        if kept((receipt.get("lineage") or {}).get("candidate_ids") or ())
     ] + [dict(receipt) for receipt in provider_receipts]
 
     batch_id = f"v6-batch-{uuid.uuid4().hex}"
@@ -3861,7 +4332,9 @@ def _news_only_successor(
         input_snapshot_id=str(predecessor["generation_input_snapshot_id"]),
         trigger_key=trigger_key,
         component_receipts=news_receipts,
-        list_search_version=str(predecessor["list_search"]["search_version"]),
+        list_search_version=str(
+            (predecessor.get("list_search") or {}).get("search_version") or LIST_SEARCH_VERSION
+        ),
         state_maintenance_receipt=predecessor.get("state_maintenance_receipt"),
         now=now,
     )
@@ -3878,9 +4351,9 @@ def _news_only_successor(
                 **deepcopy(dict(card)),
                 "card_revision_id": f"v6-revision-{uuid.uuid4().hex}",
                 "generation_batch_id": batch_id,
+                "selector_rank": rank,
             }
-            for card in predecessor_cards
-            if card["card_id"] != lead_id
+            for rank, card in enumerate(kept_predecessor, start=2)
         ),
     ]
     component_receipts = {
@@ -3902,32 +4375,38 @@ def _news_only_successor(
     if first_evidence is not None:
         component_receipts[EVIDENCE_COMPONENT_ID] = first_evidence
 
+    replaced_ids = {str(item) for item in replaced if item is not None}
+    prior_decision = predecessor.get("grounding_decision_receipt") or {}
+    prior_evidence = predecessor.get("grounding_evidence_receipt") or {}
     decisions = [
         dict(decision)
-        for decision in predecessor["grounding_decision_receipt"]["candidate_decisions"]
-        if decision["candidate_id"] not in replaced
+        for decision in prior_decision.get("candidate_decisions") or ()
+        if str(decision.get("candidate_id")) not in replaced_ids
     ] + [dict(decision) for decision in grounding.decision_receipt["candidate_decisions"]]
     admitted = sum(decision["decision"] == "admit" for decision in decisions)
     kept_candidates = [
         dict(candidate)
-        for candidate in predecessor["grounding_evidence_receipt"]["candidates"]
-        if candidate["candidate_id"] not in replaced
+        for candidate in prior_evidence.get("candidates") or ()
+        if str(candidate.get("candidate_id")) not in replaced_ids
     ]
     referenced_documents = set()
     for candidate in kept_candidates:
-        for fetch in candidate["fetches"]:
-            if fetch["document_revision_id"] is not None:
+        for fetch in candidate.get("fetches") or ():
+            if fetch.get("document_revision_id") is not None:
                 referenced_documents.add(fetch["document_revision_id"])
     for candidate in kept_candidates:
-        if candidate["extractor"] is None:
+        if candidate.get("extractor") is None:
             continue
         referenced_documents.update(
-            candidate["extractor"]["input_document_revision_ids"]
+            candidate["extractor"].get("input_document_revision_ids") or ()
         )
-    previous_documents = predecessor["grounding_evidence_receipt"]["document_snapshot"]
+    previous_documents = prior_evidence.get("document_snapshot") or {
+        "documents": [],
+        "document_revision_ids": [],
+    }
     added_documents = grounding.evidence_receipt["document_snapshot"]
     documents = [
-        document for document in previous_documents["documents"]
+        document for document in previous_documents.get("documents") or ()
         if document["document_revision_id"] in referenced_documents
     ] + list(added_documents["documents"])
     document_snapshot = {
@@ -3935,6 +4414,8 @@ def _news_only_successor(
         "document_revision_ids": [document["document_revision_id"] for document in documents],
         "documents": documents,
     }
+    prior_audit = predecessor.get("external_invocation_audit") or {"invocations": []}
+    prior_interest = predecessor.get("rid_interest_selection") or {}
     manifest = {
         **deepcopy(dict(predecessor)),
         "manifest_id": f"v6-manifest-{uuid.uuid4().hex}",
@@ -3949,14 +4430,14 @@ def _news_only_successor(
         "component_invocation_receipts": invocations,
         "ark_invocation_receipts": ark_receipts,
         "grounding_decision_receipt": {
-            **predecessor["grounding_decision_receipt"],
+            **prior_decision,
             "decision": (
                 "admit" if admitted == len(decisions) else ("abstain" if admitted == 0 else "partial")
             ),
             "candidate_decisions": decisions,
         },
         "grounding_evidence_receipt": {
-            **predecessor["grounding_evidence_receipt"],
+            **prior_evidence,
             "document_snapshot": document_snapshot,
             "candidates": [
                 *kept_candidates,
@@ -3970,8 +4451,8 @@ def _news_only_successor(
             invocations=[
                 *(
                     invocation
-                    for invocation in predecessor["external_invocation_audit"]["invocations"]
-                    if invocation["candidate_id"] not in replaced
+                    for invocation in prior_audit.get("invocations") or ()
+                    if str(invocation.get("candidate_id")) not in replaced_ids
                 ),
                 *external_audit["invocations"],
             ],
@@ -3980,7 +4461,7 @@ def _news_only_successor(
         "rid_interest_selection": {
             # A predecessor stored before restatements were recorded left none out.
             "restated_offered_candidates": [],
-            **predecessor["rid_interest_selection"],
+            **prior_interest,
             "short_trigger_delta_event_ids": [],
         },
         "provider_provenance": config.safe_provenance(),
@@ -4157,9 +4638,10 @@ class TopicPipeline:
         self._records_loader = records_loader or history.load_all_session_records
         self.completed_records_loader = self._load_completed_records
         self._context_loader = context_loader or (
-            lambda scope: _default_context_snapshot(
+            lambda scope, mode: _default_context_snapshot(
                 store,
                 scope,
+                work_mode=mode,
                 now=self._now(),
                 records_loader=self.completed_records_loader,
             )
@@ -4178,7 +4660,7 @@ class TopicPipeline:
         self._state_refresh_lock = asyncio.Lock()
         # A scope's summaries are written by its generation and by state preparation.
         self._summary_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self.on_candidates_ready: Callable[[str], None] | None = None
+        self.on_candidates_ready: Callable[[str, str], None] | None = None
         self._state_pipeline = TopicPreparePipeline(
             store,
             records_loader=self.completed_records_loader,
@@ -4223,7 +4705,11 @@ class TopicPipeline:
             await self._summarize_completed_sessions(config)
         return reason
 
-    def scope_has_pending_request(self, context_scope: str) -> bool:
+    def scope_has_pending_request(
+        self,
+        context_scope: str,
+        work_mode: str = DEFAULT_TOPIC_WORK_MODE,
+    ) -> bool:
         """A source session of the scope has a request the host is still running.
 
         The history projection marks a request without its completion row as
@@ -4232,6 +4718,7 @@ class TopicPipeline:
         """
 
         project_id_for_scope(context_scope)
+        normalized_work_mode = normalize_topic_work_mode(work_mode)
         live = set(self._active_request_ids_loader())
         if not live:
             return False
@@ -4239,6 +4726,13 @@ class TopicPipeline:
         metadata, _ = get_all_sessions_metadata(limit=1_000_000, offset=0)
         project_by_session = {
             str(item.get("session_id") or ""): (str(item.get("project_id") or "") or None)
+            for item in metadata
+            if str(item.get("session_id") or "")
+        }
+        work_mode_by_session = {
+            str(item.get("session_id") or ""): normalize_topic_work_mode(
+                item.get("work_mode")
+            )
             for item in metadata
             if str(item.get("session_id") or "")
         }
@@ -4250,6 +4744,11 @@ class TopicPipeline:
                     context_scope == GLOBAL_NEW_CHAT_SCOPE
                     and str(session_project_id or "") not in GLOBAL_PROJECT_BUCKETS
                 )
+            ):
+                continue
+            if not _work_mode_matches(
+                work_mode_by_session.get(session_id),
+                normalized_work_mode,
             ):
                 continue
             trailing: dict[str, Any] | None = None
@@ -4269,10 +4768,15 @@ class TopicPipeline:
                 return True
         return False
 
-    def scope_input_revision(self, context_scope: str) -> tuple[object, ...]:
+    def scope_input_revision(
+        self,
+        context_scope: str,
+        work_mode: str = DEFAULT_TOPIC_WORK_MODE,
+    ) -> tuple[object, ...]:
         """Detect changes to natural interests and scoped discussion coverage."""
 
         project_id_for_scope(context_scope)
+        normalized_work_mode = normalize_topic_work_mode(work_mode)
         records = self.completed_records_loader()
         metadata, _ = get_all_sessions_metadata(limit=1_000_000, offset=0)
         project_by_session = {
@@ -4282,9 +4786,21 @@ class TopicPipeline:
             for item in metadata
             if str(item.get("session_id") or "")
         }
+        work_mode_by_session = {
+            str(item.get("session_id") or ""): normalize_topic_work_mode(
+                item.get("work_mode")
+            )
+            for item in metadata
+            if str(item.get("session_id") or "")
+        }
         revision: list[object] = []
         deprojected_project_revisions: list[str] = []
         for session_id in sorted(records):
+            if not _work_mode_matches(
+                work_mode_by_session.get(session_id),
+                normalized_work_mode,
+            ):
+                continue
             session_project_id = project_by_session.get(session_id)
             scope_matches = _scope_matches(session_project_id, context_scope)
             contributes_to_global_profile = bool(
@@ -4307,12 +4823,10 @@ class TopicPipeline:
                 input_origin = str(
                     record.get("input_origin") or "pasted_or_unknown"
                 )
-                if input_origin != "manual_free_text":
-                    continue
                 assistance_origin = str(
                     record.get("assistance_origin") or "unknown"
                 )
-                if assistance_origin != "none":
+                if not is_user_revisit_eligible(input_origin, assistance_origin):
                     continue
                 witness_items.append(
                     (
@@ -4564,10 +5078,13 @@ class TopicPipeline:
     ) -> BackgroundGenerationResult:
         trigger_key = trigger.key
         trigger_origin = trigger.origin
+        work_mode = normalize_topic_work_mode(trigger_key.get("work_mode"))
         try:
             if project_id_for_scope(context_scope) != project_id:
                 raise TerminalGenerationRejection("scope_mismatch")
-            snapshot = await asyncio.to_thread(self._context_loader, context_scope)
+            snapshot = await asyncio.to_thread(
+                self._context_loader, context_scope, work_mode
+            )
         except TerminalGenerationRejection as exc:
             return _empty_result(
                 trigger_key,
@@ -4597,6 +5114,13 @@ class TopicPipeline:
                 input_snapshot_id=snapshot.input_snapshot_id,
             )
         if snapshot.project_id != project_id:
+            return _empty_result(
+                trigger_key,
+                trigger_origin,
+                "generation_input_version_mismatch",
+                input_snapshot_id=snapshot.input_snapshot_id,
+            )
+        if snapshot.work_mode != work_mode:
             return _empty_result(
                 trigger_key,
                 trigger_origin,
@@ -4709,32 +5233,43 @@ class TopicPipeline:
                 owned_stage_invoker,
                 external_audit,
             )
-            if self._search_override is None:
-                owned_search_provider = self._web_search_provider_factory(config)
-                search_provider = owned_search_provider
-            else:
+            expected_search_provider_id = str(
+                trigger_key.get("search_provider_id")
+                or self._search_provider_id
+                or ""
+            )
+            if expected_search_provider_id == UNCONFIGURED_SEARCH_PROVIDER_ID:
+                # Web search is optional enrichment. Host-evidence and hot-list
+                # candidates still ground without a search lane.
                 search_provider = self._search_override
-            actual_search_provider_id = str(
-                getattr(
-                    search_provider,
-                    "provider_id",
-                    self._search_provider_id
-                    or _INJECTED_SEARCH_AUDIT_PROVIDER_ID,
+            else:
+                if self._search_override is None:
+                    owned_search_provider = self._web_search_provider_factory(
+                        config
+                    )
+                    search_provider = owned_search_provider
+                else:
+                    search_provider = self._search_override
+                actual_search_provider_id = str(
+                    getattr(
+                        search_provider,
+                        "provider_id",
+                        self._search_provider_id
+                        or _INJECTED_SEARCH_AUDIT_PROVIDER_ID,
+                    )
                 )
-            )
-            expected_search_provider_id = (
-                self._search_provider_id or actual_search_provider_id
-            )
-            if (
-                actual_search_provider_id
-                != OPENJIUWEN_NATIVE_SEARCH_PROVIDER_ID
-                or actual_search_provider_id != expected_search_provider_id
-                or trigger_key.get("search_provider_id")
-                != expected_search_provider_id
-            ):
-                raise TerminalGenerationRejection(
-                    "search_provider_version_mismatch"
+                configured_expected = (
+                    self._search_provider_id or actual_search_provider_id
                 )
+                if (
+                    actual_search_provider_id
+                    != OPENJIUWEN_NATIVE_SEARCH_PROVIDER_ID
+                    or actual_search_provider_id != configured_expected
+                    or expected_search_provider_id != configured_expected
+                ):
+                    raise TerminalGenerationRejection(
+                        "search_provider_version_mismatch"
+                    )
             async with self._summary_locks[snapshot.context_scope]:
                 latest_summary_batch = await self._summarize_sessions(
                     snapshot,
@@ -4920,14 +5455,11 @@ class TopicPipeline:
         manifest_id: str,
         visit_id: str,
     ) -> BackgroundGenerationResult:
-        """Replace one global pool's news card with the hot list's current match (D11, D22).
+        """Inject or replace the global pool's news card from the current hot list.
 
-        The other cards stay exactly as the pool wrote them: no retrieval, no
-        scores, the same expiry. The new card answers the pool's own generation
-        input: it is matched against the same profile version, judged on the
-        pool's discussion coverage and bound to the pool's input snapshot; only
-        the hot list moved. One match, the report's question and evidence (or
-        the hot-list card), and utility on the news card alone.
+        Non-preset cards stay as written (news moves to rank 1). A pool of only
+        presets, or with no news lead yet, becomes this one news card (or news
+        plus its non-preset peers). No full pool regeneration.
         """
 
         loaded = load_exact_global_pool(self.store, manifest_id=manifest_id)
@@ -4938,7 +5470,7 @@ class TopicPipeline:
                 cards=[], manifest={"generation_trigger_key": trigger_key}, failure_reason=reason,
             )
 
-        if loaded is None or news_lead_card_id(loaded[0]) is None:
+        if loaded is None:
             return failed("no_news_card_to_replace")
         predecessor, predecessor_cards = loaded
         try:
@@ -4958,7 +5490,8 @@ class TopicPipeline:
             self.store, snapshot.state, context_scope=GLOBAL_NEW_CHAT_SCOPE, project_id=None, now=self._now(),
         )
         summaries = [
-            SessionSummaryArtifact.from_payload(item) for item in predecessor["session_summary_artifacts"]
+            SessionSummaryArtifact.from_payload(item)
+            for item in predecessor.get("session_summary_artifacts") or ()
         ]
         external_audit = ExternalInvocationAudit(
             store=self.store,
@@ -4979,6 +5512,11 @@ class TopicPipeline:
             news["discussion_coverage"] = _discussion_coverage(
                 summaries, snapshot.other_scope_discussion_coverage
             )
+            prior_documents = (
+                ((predecessor.get("grounding_evidence_receipt") or {}).get("document_snapshot") or {})
+                .get("documents")
+                or ()
+            )
             grounding = await self._ground_plans(
                 [news],
                 snapshot=snapshot,
@@ -4988,9 +5526,7 @@ class TopicPipeline:
                 external_audit=external_audit,
                 search_provider=self._search_override or _unconfigured_v6_search,
                 # The pool's documents keep their numbers; the new ones follow them.
-                first_document_number=len(
-                    predecessor["grounding_evidence_receipt"]["document_snapshot"]["documents"]
-                ) + 1,
+                first_document_number=len(prior_documents) + 1,
             )
             [grounded] = grounding.plans
             if not feedback.still_wanted(grounded):
@@ -5041,6 +5577,121 @@ class TopicPipeline:
             if callable(close):
                 await close()
 
+    @staticmethod
+    def _summary_stage_budget(
+        config: ArkBackgroundConfig,
+    ) -> tuple[history.StageTokenCounter, int]:
+        """Counting and limit the summarizer's batches must fit (fail closed)."""
+
+        if config.context_window_tokens is None:
+            raise TerminalGenerationRejection(
+                "session_summary_context_limit_unverified"
+            )
+        try:
+            counter = history.StageTokenCounter(config.model)
+        except history.ContextCountingUnverified as exc:
+            raise TerminalGenerationRejection(
+                "session_summary_context_limit_unverified"
+            ) from exc
+        return counter, int(config.context_window_tokens)
+
+    @staticmethod
+    def _fit_rid_inputs(
+        config: ArkBackgroundConfig,
+        rid_inputs: dict[str, Any],
+        *,
+        required_summary_ids: Iterable[str] = (),
+    ) -> None:
+        """Shrink the one RID call to the provider window by dropping oldest inputs."""
+
+        if config.context_window_tokens is None:
+            raise TerminalGenerationRejection("rid_context_limit_unverified")
+        try:
+            counter = history.StageTokenCounter(config.model)
+        except history.ContextCountingUnverified as exc:
+            raise TerminalGenerationRejection(
+                "rid_context_limit_unverified"
+            ) from exc
+        try:
+            fitted = _fit_rid_inputs_to_budget(
+                rid_inputs,
+                counter=counter,
+                limit=int(config.context_window_tokens),
+                required_summary_ids=required_summary_ids,
+            )
+        except history.ContextCountingUnverified as exc:
+            raise TerminalGenerationRejection(
+                "rid_context_limit_unverified"
+            ) from exc
+        if not fitted:
+            raise TerminalGenerationRejection("rid_context_limit")
+
+    def _load_reusable_session_summary(
+        self,
+        *,
+        summary_id: str,
+        session_id: str,
+        context_scope: str,
+        input_origin: str,
+        assistance_origin: str,
+        source_event_ids: Sequence[str],
+        source_locators: Sequence[SessionSourceLocator],
+        completion_boundary: SessionCompletionBoundary,
+        completed_at: float,
+    ) -> SessionSummaryArtifact | None:
+        """Return a stored summary for the same conversation content, if any.
+
+        Exact content digests hit first. Legacy rows whose id still embedded
+        summarizer model/config are reused when turns and completion boundary
+        match, so a model switch does not rewrite history.
+        """
+
+        rows = self.store.query_events(
+            event_type="session_summary",
+            topic_id=summary_id,
+            policy_id=POLICY_ID,
+            limit=2,
+            newest_first=True,
+        )
+        payload: Mapping[str, Any] | None = None
+        if rows:
+            if len(rows) != 1 or not isinstance(rows[0].get("payload"), dict):
+                raise TerminalGenerationRejection(
+                    "session_summary_persistence_conflict"
+                )
+            payload = rows[0]["payload"]
+        else:
+            latest = _latest_session_summaries(
+                self.store, context_scope, {session_id},
+            ).get(session_id)
+            if isinstance(latest, Mapping):
+                payload = latest
+        if payload is None:
+            return None
+        try:
+            cached = SessionSummaryArtifact.from_payload(payload)
+        except ValueError as exc:
+            raise TerminalGenerationRejection(
+                "session_summary_persistence_conflict"
+            ) from exc
+        if not _session_summary_content_matches(
+            cached,
+            session_id=session_id,
+            context_scope=context_scope,
+            input_origin=input_origin,
+            assistance_origin=assistance_origin,
+            source_event_ids=source_event_ids,
+            source_locators=source_locators,
+            completion_boundary=completion_boundary,
+            completed_at=completed_at,
+        ):
+            if rows:
+                raise TerminalGenerationRejection(
+                    "session_summary_persistence_conflict"
+                )
+            return None
+        return cached
+
     async def _summarize_sessions(
         self,
         snapshot: V6ContextSnapshot,
@@ -5049,10 +5700,6 @@ class TopicPipeline:
         invoke_stage: StageInvoker,
     ) -> _SessionSummaryBatch:
         provider_version = config.expected_model or config.model
-        reasoning_effort = _v6_reasoning_effort(
-            "v6_session_summarizer",
-            model=config.model,
-        )
         summary_config_version = (
             f"{SESSION_SUMMARY_CONFIG_VERSION}:"
             f"request_model={config.model}:"
@@ -5061,7 +5708,7 @@ class TopicPipeline:
             f"top_p={config.effective_top_p}:"
             f"context={config.context_window_tokens}:"
             f"base_url={config.base_url}:"
-            f"reasoning_effort={reasoning_effort}"
+            "reasoning_effort=disabled"
         )
         grouped: dict[str, list[V6SourceMessage]] = defaultdict(list)
         for message in snapshot.messages:
@@ -5085,77 +5732,51 @@ class TopicPipeline:
         }
         if set(grouped) - set(prefixes_by_session):
             raise TerminalGenerationRejection("session_completion_boundary_missing")
+        selected_sessions = _recent_summary_sessions(
+            grouped,
+            prefixes_by_session,
+            delta_event_ids=snapshot.delta_event_ids,
+            now=self._now(),
+        )
+        selected_grouped: dict[str, list[V6SourceMessage]] = {}
+        for session_id in selected_sessions:
+            selected_grouped[session_id] = grouped[session_id]
+        grouped = selected_grouped
         artifacts_by_session: dict[str, SessionSummaryArtifact] = {}
         pending_sessions: list[dict[str, Any]] = []
         pending_metadata: dict[str, dict[str, Any]] = {}
         generated_summary_ids: list[str] = []
         for session_id in sorted(grouped):
             messages = sorted(grouped[session_id], key=lambda item: item.ordinal)
-            abstract_context = list(
-                dict.fromkeys(
-                    item.intent_cluster
-                    for item in messages
-                    if item.intent_cluster and item.intent_cluster != "unmapped"
-                )
-            )
-            input_origins = tuple(dict.fromkeys(item.input_origin for item in messages))
-            assistance_origins = tuple(
-                dict.fromkeys(item.assistance_origin for item in messages)
-            )
-            input_origin = input_origins[0] if len(input_origins) == 1 else "mixed"
-            assistance_origin = (
-                assistance_origins[0]
-                if len(assistance_origins) == 1
-                else "mixed"
-            )
-            session_payload: dict[str, Any] = {
-                "session_id": session_id,
-                "abstract_context": abstract_context or ["general_interest"],
-                "interaction_pattern": [message.action_type for message in messages],
-                "input_origin": input_origin,
-                "assistance_origin": assistance_origin,
-                "messages": [
-                    {
-                        "event_id": message.event_id,
-                        "ordinal": message.ordinal,
-                        "request_id": message.request_id,
-                        "role": "user",
-                        "content": message.content,
-                        "assistant_answer": message.assistant_answer,
-                        "assistance_origin": message.assistance_origin,
-                    }
-                    for message in messages
-                ],
-            }
+            input_origin, assistance_origin = _summary_origins(messages)
+            # Coverage, the digest and the model request share one turn selection.
+            session_payload = _session_identity_payload(session_id, messages)
             boundary = prefixes_by_session[session_id].boundary
-            source_event_ids = tuple(item.event_id for item in messages)
+            covered = [
+                message
+                for message in messages
+                if message.event_id in _summary_coverage_ids(messages)
+            ]
+            source_event_ids = tuple(item.event_id for item in covered)
             source_locators = tuple(
                 SessionSourceLocator(
                     session_id=item.session_id,
                     ordinal=item.ordinal,
                     event_id=item.event_id,
                 )
-                for item in messages
+                for item in covered
             )
-            semantic_identity = {
-                "context_scope": snapshot.context_scope,
-                "session": session_payload,
-                "source_event_ids": list(source_event_ids),
-                "source_locators": [item.as_payload() for item in source_locators],
-                "completion_boundary": boundary.as_payload(),
-                "summary_provider_id": "ark",
-                "summary_provider_version": provider_version,
-                "summary_config_version": summary_config_version,
-            }
-            semantic_digest = hashlib.sha256(
-                json.dumps(
-                    semantic_identity,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("utf-8")
-            ).hexdigest()
-            summary_id = f"summary:{session_id}:{semantic_digest}"
+            content_identity = _session_summary_content_identity(
+                context_scope=snapshot.context_scope,
+                session_payload=session_payload,
+                source_event_ids=source_event_ids,
+                source_locators=source_locators,
+                completion_boundary=boundary,
+            )
+            summary_id = (
+                f"summary:{session_id}:"
+                f"{_session_summary_content_digest(content_identity)}"
+            )
             metadata = {
                 "session_summary_id": summary_id,
                 "session_id": session_id,
@@ -5170,54 +5791,93 @@ class TopicPipeline:
                 "summary_provider_version": provider_version,
                 "summary_config_version": summary_config_version,
             }
-            rows = self.store.query_events(
-                event_type="session_summary",
-                topic_id=summary_id,
-                policy_id=POLICY_ID,
-                limit=2,
-                newest_first=True,
+            cached = self._load_reusable_session_summary(
+                summary_id=summary_id,
+                session_id=session_id,
+                context_scope=snapshot.context_scope,
+                input_origin=input_origin,
+                assistance_origin=assistance_origin,
+                source_event_ids=source_event_ids,
+                source_locators=source_locators,
+                completion_boundary=boundary,
+                completed_at=boundary.completed_at,
             )
-            if rows:
-                if len(rows) != 1 or not isinstance(rows[0].get("payload"), dict):
-                    raise TerminalGenerationRejection(
-                        "session_summary_persistence_conflict"
-                    )
-                try:
-                    cached = SessionSummaryArtifact.from_payload(rows[0]["payload"])
-                except ValueError as exc:
-                    raise TerminalGenerationRejection(
-                        "session_summary_persistence_conflict"
-                    ) from exc
-                if any(
-                    getattr(cached, field) != value
-                    for field, value in metadata.items()
-                ):
-                    raise TerminalGenerationRejection(
-                        "session_summary_persistence_conflict"
-                    )
+            if cached is not None:
                 artifacts_by_session[session_id] = cached
                 continue
-            pending_sessions.append(session_payload)
+            pending_sessions.append(_session_model_payload(session_id, messages))
             pending_metadata[session_id] = metadata
 
         if pending_sessions:
-            summaries_by_session = await self._request_session_summaries(
-                snapshot, pending_sessions, invoke_stage=invoke_stage
+            counter, limit = self._summary_stage_budget(config)
+            bounded_sessions: list[dict[str, Any]] = []
+            for session in pending_sessions:
+                fitted = _fit_summary_session(
+                    session,
+                    counter=counter,
+                    snapshot=snapshot,
+                    limit=limit,
+                )
+                if fitted is None:
+                    raise TerminalGenerationRejection(
+                        "session_summary_session_too_large"
+                    )
+                bounded_sessions.append(fitted)
+            batches = _plan_summary_batches(
+                bounded_sessions,
+                counter=counter,
+                snapshot=snapshot,
+                limit=limit,
             )
-            # A first preparation sends every session of the scope at once. A session
-            # the answer leaves out, names twice, misnames or leaves blank is asked
-            # for once more; one still unsummarized after that fails the preparation.
-            unsummarized = [
-                session
-                for session in pending_sessions
-                if session["session_id"] not in summaries_by_session
-            ]
-            if unsummarized:
-                summaries_by_session.update(
-                    await self._request_session_summaries(
-                        snapshot, unsummarized, invoke_stage=invoke_stage
+            if batches is None:
+                raise TerminalGenerationRejection(
+                    "session_summary_context_limit"
+                )
+            semaphore = asyncio.Semaphore(_SUMMARY_BATCH_CONCURRENCY)
+
+            async def summarize_batch(
+                batch: list[dict[str, Any]],
+            ) -> dict[str, str]:
+                async with semaphore:
+                    answered = await self._request_session_summaries(
+                        snapshot, batch, invoke_stage=invoke_stage
+                    )
+                    # A session the answer leaves out, names twice, misnames or
+                    # leaves blank is asked for once more; one still unsummarized
+                    # after that fails the preparation.
+                    unsummarized = [
+                        session
+                        for session in batch
+                        if session["session_id"] not in answered
+                    ]
+                    if unsummarized:
+                        answered.update(
+                            await self._request_session_summaries(
+                                snapshot, unsummarized, invoke_stage=invoke_stage
+                            )
+                        )
+                    return answered
+
+            tasks = [
+                asyncio.create_task(
+                    summarize_batch(
+                        [bounded_sessions[position] for position in positions]
                     )
                 )
+                for positions in batches
+            ]
+            try:
+                results = await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            summaries_by_session: dict[str, str] = {
+                session_id: summary
+                for result in results
+                for session_id, summary in result.items()
+            }
             if set(summaries_by_session) != set(pending_metadata):
                 raise TerminalGenerationRejection("session_summary_contract_failed")
             for session_id, summary in summaries_by_session.items():
@@ -5273,14 +5933,11 @@ class TopicPipeline:
         response = await invoke_stage(
             "v6_session_summarizer",
             _SESSION_SUMMARY_PROMPT,
-            json.dumps(
-                {
-                    "input_snapshot_id": snapshot.input_snapshot_id,
-                    "request_id": f"v6-session-summary-{uuid.uuid4().hex}",
-                    "context_scope": snapshot.context_scope,
-                    "sessions": list(sessions),
-                },
-                ensure_ascii=False,
+            _summary_request_payload(
+                snapshot.input_snapshot_id,
+                snapshot.context_scope,
+                sessions,
+                request_id=f"v6-session-summary-{uuid.uuid4().hex}",
             ),
         )
         items = (
@@ -5320,9 +5977,10 @@ class TopicPipeline:
         waits for it and reuses its summaries. A conversation is summarized
         again once a completed turn of it is missing from its latest summary.
         Only the summaries are written: no coverage receipt, as no generation
-        consumed them. A summary configuration upgrade, and a scope with more
-        than ``_PREPARED_SUMMARY_LIMIT`` such conversations (a first
-        preparation with history), are left to that scope's own generation.
+        consumed them. A scope with more than ``_PREPARED_SUMMARY_LIMIT`` such
+        conversations (a first preparation with history) is left to that
+        scope's own generation. Model or summarizer-config changes reuse
+        content-matched summaries instead of rewriting them.
         """
 
         try:
@@ -5343,19 +6001,45 @@ class TopicPipeline:
                     if _scope_matches(project_id, GLOBAL_NEW_CHAT_SCOPE)
                     else f"project:{project_id}"
                 )
+                answers = _completed_answers(session_id, session_records)
+                record_turns = []
+                for ordinal in sorted(prefix.completed_user_ordinals):
+                    record = session_records[ordinal]
+                    if not _summarizable_user_turn(record):
+                        continue
+                    event_id = str(record.get("id") or record.get("request_id") or "")
+                    content = record.get("content")
+                    if not event_id or not isinstance(content, str):
+                        continue
+                    record_turns.append((
+                        event_id,
+                        content,
+                        answers.get(str(record.get("request_id") or "")),
+                    ))
                 turn_ids = {
-                    str(session_records[ordinal].get("id") or session_records[ordinal].get("request_id") or "")
-                    for ordinal in prefix.completed_user_ordinals
-                    if _summarizable_user_turn(session_records[ordinal])
+                    event_id
+                    for event_id, _, _ in _select_summary_turns(record_turns)
                 }
                 if turn_ids:
                     completed_by_scope[scope][session_id] = (prefix.boundary.completed_at, turn_ids)
             pending_by_scope: dict[str, set[str]] = {}
+            cutoff = self._now() - _SUMMARY_SESSION_WINDOW_SECONDS
             for scope, completed in completed_by_scope.items():
-                latest = _latest_session_summaries(self.store, scope, set(completed))
+                ranked = sorted(
+                    (
+                        (session_id, completed_at, turn_ids)
+                        for session_id, (completed_at, turn_ids) in completed.items()
+                        if completed_at >= cutoff and turn_ids
+                    ),
+                    key=lambda item: (-item[1], item[0]),
+                )
+                selected = ranked[:_SUMMARY_SESSION_LIMIT]
+                latest = _latest_session_summaries(
+                    self.store, scope, {session_id for session_id, _, _ in selected},
+                )
                 pending = {
                     session_id
-                    for session_id, (completed_at, turn_ids) in completed.items()
+                    for session_id, completed_at, turn_ids in selected
                     if _summary_lags(latest.get(session_id), completed_at, turn_ids)
                 }
                 if 0 < len(pending) <= _PREPARED_SUMMARY_LIMIT:
@@ -5390,15 +6074,18 @@ class TopicPipeline:
         # latest summary lacks one of them, or their boundary, are summarized.
         latest = _latest_session_summaries(self.store, context_scope, session_ids)
         boundaries = {item.boundary.session_id: item.boundary for item in snapshot.completed_session_prefixes}
-        turn_ids: defaultdict[str, set[str]] = defaultdict(set)
+        grouped_messages: dict[str, list[V6SourceMessage]] = defaultdict(list)
         for item in snapshot.messages:
             if item.session_id in session_ids:
-                turn_ids[item.session_id].add(item.event_id)
-        pending = {
-            session_id
-            for session_id, ids in turn_ids.items()
-            if _summary_lags(latest.get(session_id), boundaries[session_id].completed_at, ids)
-        }
+                grouped_messages[item.session_id].append(item)
+        pending: set[str] = set()
+        for session_id, session_messages in grouped_messages.items():
+            if _summary_lags(
+                latest.get(session_id),
+                boundaries[session_id].completed_at,
+                _summary_coverage_ids(session_messages),
+            ):
+                pending.add(session_id)
         if not pending:
             return ""
         snapshot = replace(
@@ -5509,7 +6196,10 @@ class TopicPipeline:
             summaries,
             context_scope=snapshot.context_scope,
         )
-        wanted_summaries = _wanted_session_summaries(snapshot, eligible_summaries, feedback)
+        wanted_summaries = _recent_rid_summaries(
+            _wanted_session_summaries(snapshot, eligible_summaries, feedback),
+            required_ids=_short_delta_summary_ids(snapshot, eligible_summaries),
+        )
         wanted_profile_interests = _wanted_profile_interests(snapshot, feedback)
         frozen_decision_time = (
             self._now() if decision_time is None else float(decision_time)
@@ -5604,6 +6294,13 @@ class TopicPipeline:
         )
         if reused is not None:
             return reused
+        self._fit_rid_inputs(
+            config,
+            rid_inputs,
+            required_summary_ids=_short_delta_summary_ids(
+                snapshot, eligible_summaries
+            ),
+        )
         frozen_request: dict[str, Any] = {}
         rid_response: Any = None
 
@@ -5806,7 +6503,7 @@ class TopicPipeline:
         for entry in pulled:
             if card_copy_rejection_reason(_hot_list_title(entry.word)) is not None:
                 continue
-            if feedback.blocks_news(search_page_url(entry.word)):
+            if feedback.blocks_news(hot_list_open_url(entry, pull)):
                 continue
             if feedback.blocks_news_event(hot_event_key(entry.word)):
                 continue
@@ -5967,6 +6664,7 @@ class TopicPipeline:
         carried_over: int,
         offered_questions: Sequence[dict[str, Any]] | None = None,
         news_lead: bool = False,
+        enable_recent_web: bool = True,
         lanes: _OptionalLanes | None = None,
         on_recent_plans: Callable[[Sequence[dict[str, Any]]], None] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -6097,28 +6795,30 @@ class TopicPipeline:
                 on_recent_plans([plan for plan in plans if feedback.still_wanted(plan)])
             return plans
 
-        recent_task = asyncio.ensure_future(recent_plans(invoke_stage(
-            "v6_recent_candidate_generator",
-            _RECENT_PROMPT,
-            json.dumps(
-                {
-                    "input_snapshot_id": snapshot.input_snapshot_id,
-                    "local_date": time.strftime(
-                        "%Y-%m-%d", time.localtime(self._now())
-                    ),
-                    "profile_projection": snapshot.profile_projection,
-                    "ranked_interests": [asdict(item) for item in ranked],
-                    "required_category": "profile_recent_progress",
-                    "previously_offered": search_offered_questions,
-                    "discussion_coverage": _discussion_coverage(summaries),
-                    "negative_preferences": feedback.model_payloads(),
-                    "direction_feedback": feedback.direction_payloads(),
-                    "candidate_slots": recent_candidate_slots,
-                    "request_id": f"v6-recent-{uuid.uuid4().hex}",
-                },
-                ensure_ascii=False,
-            ),
-        )))
+        recent_task: asyncio.Future[list[dict[str, Any]]] | None = None
+        if enable_recent_web:
+            recent_task = asyncio.ensure_future(recent_plans(invoke_stage(
+                "v6_recent_candidate_generator",
+                _RECENT_PROMPT,
+                json.dumps(
+                    {
+                        "input_snapshot_id": snapshot.input_snapshot_id,
+                        "local_date": time.strftime(
+                            "%Y-%m-%d", time.localtime(self._now())
+                        ),
+                        "profile_projection": snapshot.profile_projection,
+                        "ranked_interests": [asdict(item) for item in ranked],
+                        "required_category": "profile_recent_progress",
+                        "previously_offered": search_offered_questions,
+                        "discussion_coverage": _discussion_coverage(summaries),
+                        "negative_preferences": feedback.model_payloads(),
+                        "direction_feedback": feedback.direction_payloads(),
+                        "candidate_slots": recent_candidate_slots,
+                        "request_id": f"v6-recent-{uuid.uuid4().hex}",
+                    },
+                    ensure_ascii=False,
+                ),
+            )))
         # A direction back from a dismissal reaches the generator as "reduced"; the host
         # keeps its count and days, and ranks its cards after the others.
         interest_lineage = {
@@ -6186,27 +6886,29 @@ class TopicPipeline:
                     now=self._now(),
                 )
             lanes.mandatory_ready()
-            recent = []
-            try:
-                if await lanes.finish(GLOBAL_RECENT_LANE, recent_task):
-                    recent = recent_task.result()
-            except Exception as exc:
-                logger.warning(
-                    "Topic Starter v6 optional global recent generation failed; "
-                    "retaining interest candidates",
-                    exc_info=True,
-                )
-                lanes.failed[GLOBAL_RECENT_LANE] = (
-                    exc.reason if isinstance(exc, TerminalGenerationRejection)
-                    else "provider_invocation_failed"
-                )
+            recent: list[dict[str, Any]] = []
+            if recent_task is not None:
+                try:
+                    if await lanes.finish(GLOBAL_RECENT_LANE, recent_task):
+                        recent = recent_task.result()
+                except Exception as exc:
+                    logger.warning(
+                        "Topic Starter v6 optional global recent generation failed; "
+                        "retaining interest candidates",
+                        exc_info=True,
+                    )
+                    lanes.failed[GLOBAL_RECENT_LANE] = (
+                        exc.reason if isinstance(exc, TerminalGenerationRejection)
+                        else "provider_invocation_failed"
+                    )
         finally:
-            for task in (recent_task, interest_task):
+            pending = [
+                task for task in (recent_task, interest_task) if task is not None
+            ]
+            for task in pending:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(
-                recent_task, interest_task, return_exceptions=True
-            )
+            await asyncio.gather(*pending, return_exceptions=True)
         # A plan the pool reader would drop for a dismissal in force is left out
         # before grounding and scoring.
         wanted, withheld = [], []
@@ -7271,8 +7973,30 @@ class TopicPipeline:
         lanes = lanes if lanes is not None else _OptionalLanes()
         web_plans = [plan for plan in plans if _host_evidence(plan) is None]
         snapshot_date = str(trigger_key["local_date"])
-        if (search_provider or self._search_override) is None:
-            raise TerminalGenerationRejection("web_search_provider_unavailable")
+        active_search = search_provider or self._search_override
+        if not web_plans:
+            return _FrozenEvidenceBatch(None, {}, {}, {}, {}, {})
+        if active_search is None:
+            # Keep host-evidence grounding; drop web candidates without a search lane.
+            rejections = {
+                str(plan["candidate_id"]): (
+                    "search",
+                    "web_search_provider_unavailable",
+                )
+                for plan in web_plans
+            }
+            evidence_by_candidate = {
+                str(plan["candidate_id"]): {
+                    "candidate_id": str(plan["candidate_id"]),
+                    "search": None,
+                    "fetches": [],
+                    "extractor": None,
+                }
+                for plan in web_plans
+            }
+            return _FrozenEvidenceBatch(
+                None, {}, {}, rejections, {}, evidence_by_candidate,
+            )
         # A candidate whose evidence started early is joined, not searched again.
         started = early_evidence or {}
         owns_fetches = fetch_tasks is None
@@ -7603,6 +8327,29 @@ class TopicPipeline:
         ]
         if not candidates:
             return {}
+        if config.context_window_tokens is None:
+            raise TerminalGenerationRejection("recent_finalization_context_limit")
+        try:
+            counter = history.StageTokenCounter(config.model)
+            fitted_candidates = _fit_recent_finalizer_candidates(
+                candidates,
+                counter=counter,
+                limit=int(config.context_window_tokens),
+                input_snapshot_id=snapshot.input_snapshot_id,
+                discussion_coverage=plans[0].get("discussion_coverage", []),
+                previously_offered=plans[0].get("previously_offered", []),
+            )
+        except history.ContextCountingUnverified as exc:
+            raise TerminalGenerationRejection(
+                "recent_finalization_context_limit"
+            ) from exc
+        if not fitted_candidates:
+            raise TerminalGenerationRejection("recent_finalization_context_limit")
+        candidates = fitted_candidates
+        kept_ids = {str(item["candidate_id"]) for item in candidates}
+        finalized = [
+            plan for plan in finalized if str(plan["candidate_id"]) in kept_ids
+        ]
         payload = json.dumps({
             "input_snapshot_id": snapshot.input_snapshot_id,
             "discussion_coverage": plans[0].get("discussion_coverage", []),
@@ -7610,11 +8357,6 @@ class TopicPipeline:
             "candidates": candidates,
             "request_id": f"v6-finalize-{uuid.uuid4().hex}",
         }, ensure_ascii=False)
-        counter = history.StageTokenCounter(config.model)
-        if config.context_window_tokens is None or counter.estimate_stage_tokens(
-            _RECENT_FINALIZER_PROMPT, payload, 4096
-        ) > config.context_window_tokens:
-            raise TerminalGenerationRejection("recent_finalization_context_limit")
         response = await lanes.within(
             lambda: invoke_stage("v6_recent_finalizer", _RECENT_FINALIZER_PROMPT, payload),
             *{_optional_lane(plan) for plan in finalized},
@@ -7652,7 +8394,7 @@ class TopicPipeline:
         config: ArkBackgroundConfig,
         invoke_stage: StageInvoker,
         external_audit: ExternalInvocationAudit,
-        search_provider: WebSearchFn,
+        search_provider: WebSearchFn | None,
         first_document_number: int = 1,
         lanes: _OptionalLanes | None = None,
         on_regular_ready: Callable[[Sequence[dict[str, Any]]], None] | None = None,
@@ -8592,7 +9334,8 @@ class TopicPipeline:
                 if component_invocation_applies_to_card(invocation, card)
             ]
         manifest_id = f"v6-manifest-{uuid.uuid4().hex}"
-        preference_pairs = mine_hierarchical_pairs(selection.bounded_beam_trace)
+        # Thin list-search receipt: keep preferred ids / bounds, drop beam entries
+        # and preference-pair replay. Document snapshot stays under grounding only.
         manifest = {
             "manifest_id": manifest_id,
             "generation_batch_id": batch_id,
@@ -8601,13 +9344,13 @@ class TopicPipeline:
             "local_date": trigger_key["local_date"],
             "context_scope": snapshot.context_scope,
             "project_id": snapshot.project_id,
+            "work_mode": normalize_topic_work_mode(trigger_key.get("work_mode")),
             "generation_trigger_key": trigger_key,
             "generation_input_snapshot_id": snapshot.input_snapshot_id,
             "serving_compatibility_key": build_serving_compatibility_key(trigger_key),
             "profile_semantic_version": trigger_key["profile_semantic_version"],
             "short_intent_version": trigger_key["short_intent_version"],
             "negative_preference_version": trigger_key["negative_preference_version"],
-            "document_snapshot": document_snapshot,
             "search_provider_id": trigger_key["search_provider_id"],
             "search_receipts": {
                 str(plan["candidate_id"]): (
@@ -8663,20 +9406,13 @@ class TopicPipeline:
                 ],
                 "bounded_beam_trace": {
                     **asdict(selection.bounded_beam_trace),
-                    "entries": [
-                        {
-                            **asdict(entry),
-                            "candidate_ids": list(entry.candidate_ids),
-                            "failure_reasons": list(entry.failure_reasons),
-                        }
-                        for entry in selection.bounded_beam_trace.entries
-                    ],
+                    "entries": [],
                     "preferred_candidate_ids": list(
                         selection.bounded_beam_trace.preferred_candidate_ids
                     ),
                 },
             },
-            "preference_pairs": [item.as_payload() for item in preference_pairs],
+            "preference_pairs": [],
             **({"news_slot": dict(news_slot)} if news_slot is not None else {}),
             # Optional lanes whose calls were cut when their grace ended.
             **(
@@ -8719,7 +9455,7 @@ class TopicPipeline:
         config: ArkBackgroundConfig,
         invoke_stage: StageInvoker,
         external_audit: ExternalInvocationAudit,
-        search_provider: WebSearchFn,
+        search_provider: WebSearchFn | None,
         summary_batch: _SessionSummaryBatch | None = None,
     ) -> BackgroundGenerationResult:
         if summary_batch is None:
@@ -8781,7 +9517,7 @@ class TopicPipeline:
         config: ArkBackgroundConfig,
         invoke_stage: StageInvoker,
         external_audit: ExternalInvocationAudit,
-        search_provider: WebSearchFn,
+        search_provider: WebSearchFn | None,
         early_evidence: dict[str, asyncio.Future[_CandidateEvidence]],
         fetch_tasks: _FetchTasks,
     ) -> BackgroundGenerationResult | None:
@@ -8871,7 +9607,7 @@ class TopicPipeline:
         config: ArkBackgroundConfig,
         invoke_stage: StageInvoker,
         external_audit: ExternalInvocationAudit,
-        search_provider: WebSearchFn,
+        search_provider: WebSearchFn | None,
         summary_batch: _SessionSummaryBatch,
         hot_list_pull: HotListPull | None,
         news_task: asyncio.Future[tuple[dict[str, Any] | None, str | None]] | None,
@@ -8879,7 +9615,7 @@ class TopicPipeline:
         fetch_tasks: _FetchTasks,
     ) -> BackgroundGenerationResult:
         if self.on_candidates_ready:
-            self.on_candidates_ready(snapshot.context_scope)
+            self.on_candidates_ready(snapshot.context_scope, snapshot.work_mode)
         summaries = summary_batch.artifacts
         decision_time = self._now()
         rid = await self._distill_interests(
@@ -9015,6 +9751,10 @@ class TopicPipeline:
                 carried_over=len(retained),
                 offered_questions=offered_questions,
                 news_lead=hot_list_pull is not None,
+                enable_recent_web=(
+                    (search_provider or self._search_override) is not None
+                    and topic_web_search_engines_enabled()
+                ),
                 lanes=lanes,
                 on_recent_plans=start_recent_evidence,
             )

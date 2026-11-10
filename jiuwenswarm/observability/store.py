@@ -25,7 +25,7 @@ from openjiuwen.extensions.observability.content_addressing import (
     rebuild_value,
 )
 
-from gateway.common.mode_matrix import (
+from agent_gateway.common.mode_matrix import (
     SINGLE_AGENT_CANONICAL_MODES,
     TEAM_CANONICAL_MODES,
 )
@@ -95,6 +95,18 @@ eligible_traces AS (
             THEN 1 ELSE 0
         END
     ) = 0
+)
+"""
+
+# Tests one frame (aliased ``frames``) against ``eligible_traces``; needs the
+# CTE above in the same statement.
+_ELIGIBLE_FRAME_PREDICATE = """
+EXISTS (
+    SELECT 1
+    FROM trajectory_frame_spans AS eligible_spans
+    INNER JOIN eligible_traces
+        ON eligible_traces.trace_id = eligible_spans.trace_id
+    WHERE eligible_spans.span_ref = frames.span_ref
 )
 """
 
@@ -2242,17 +2254,29 @@ class AsyncTrajectoryReader:
             return None
         try:
             await connection.execute("BEGIN")
+            # Every query here walks frames by frame_seq and tests each frame's
+            # trace on the way, so a page costs what it returns. Joining from
+            # the eligible traces instead reached every frame they own and
+            # sorted them, which grew with every frame a session ever kept --
+            # unbounded once ``discard_final_span_frames`` is off.
             aggregate = await _fetch_one(
                 connection,
                 f"""
                 WITH {_ELIGIBLE_TRACES_CTE}
-                SELECT MIN(frames.frame_seq) AS first_frame_seq,
-                       MAX(frames.frame_seq) AS current_frame_seq
-                FROM trajectory_stream_frames AS frames
-                INNER JOIN trajectory_frame_spans AS spans
-                    ON spans.span_ref = frames.span_ref
-                INNER JOIN eligible_traces
-                    ON eligible_traces.trace_id = spans.trace_id
+                SELECT (
+                           SELECT frames.frame_seq
+                           FROM trajectory_stream_frames AS frames
+                           WHERE {_ELIGIBLE_FRAME_PREDICATE}
+                           ORDER BY frames.frame_seq ASC
+                           LIMIT 1
+                       ) AS first_frame_seq,
+                       (
+                           SELECT frames.frame_seq
+                           FROM trajectory_stream_frames AS frames
+                           WHERE {_ELIGIBLE_FRAME_PREDICATE}
+                           ORDER BY frames.frame_seq DESC
+                           LIMIT 1
+                       ) AS current_frame_seq
                 """,
                 _trajectory_scope_params(),
             )
@@ -2293,9 +2317,8 @@ class AsyncTrajectoryReader:
                 FROM trajectory_stream_frames AS frames
                 INNER JOIN trajectory_frame_spans AS spans
                     ON spans.span_ref = frames.span_ref
-                INNER JOIN eligible_traces
-                    ON eligible_traces.trace_id = spans.trace_id
                 WHERE frames.frame_seq > ?
+                  AND {_ELIGIBLE_FRAME_PREDICATE}
                 ORDER BY frames.frame_seq ASC
                 LIMIT ?
                 """,

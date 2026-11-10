@@ -17,6 +17,10 @@ from typing import Any, Awaitable, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
+from jiuwenswarm.agents.harness.common.recommendation.topic_search import (
+    UNCONFIGURED_SEARCH_PROVIDER_ID,
+)
+
 _ACTIVE_HOST: "RecommendationHost | None" = None
 
 
@@ -44,6 +48,8 @@ def _build_topic_starter_services(
     topic_starter_store: Any,
     *,
     active_request_ids_loader: Callable[[], Iterable[str]] | None = None,
+    prepare_service: Any = None,
+    outcome_queue: Any = None,
 ) -> tuple[Any, Any | None, Any]:
     """Always build the prepare lane; leave a misconfigured product lane disabled."""
 
@@ -87,34 +93,38 @@ def _build_topic_starter_services(
         return {sid: permitted_recommendation_history(rows, control)
                 for sid, rows in load_all_session_records().items()}
 
-    topic_prepare = TopicPreparePipeline(topic_starter_store, records_loader=permitted_records)
-    topic_prepare_service = TopicPrepareService(
-        topic_starter_store,
-        generate=topic_prepare.generate_prepared,
-        prepare_state=topic_prepare.refresh_state,
-    )
-    topic_outcome_queue = NewPageOutcomeQueue()
-    topic_outcome_queue.attach_sink(
-        TopicStarterStoreOutcomeSink(topic_starter_store)
-    )
-
-    try:
-        topic_pipeline = TopicPipeline(
+    topic_prepare_service = prepare_service
+    if topic_prepare_service is None:
+        topic_prepare = TopicPreparePipeline(topic_starter_store, records_loader=permitted_records)
+        topic_prepare_service = TopicPrepareService(
             topic_starter_store,
-            records_loader=permitted_records,
-            active_request_ids_loader=active_request_ids_loader,
+            generate=topic_prepare.generate_prepared,
+            prepare_state=topic_prepare.refresh_state,
         )
+    topic_outcome_queue = outcome_queue
+    if topic_outcome_queue is None:
+        topic_outcome_queue = NewPageOutcomeQueue()
+        topic_outcome_queue.attach_sink(
+            TopicStarterStoreOutcomeSink(topic_starter_store)
+        )
+
+    topic_pipeline = TopicPipeline(
+        topic_starter_store,
+        records_loader=permitted_records,
+        active_request_ids_loader=active_request_ids_loader,
+    )
+    try:
         search_provider_id = topic_pipeline.search_provider_id
     except OpenJiuwenNativeSearchContractError as exc:
+        # Web search is optional enrichment. Without it the product lane still
+        # writes personalized host-evidence and hot-list pools; a later configured
+        # lane changes the compatibility key and rebuilds.
         logger.warning(
-            "[Topic] disabled at startup: %s",
+            "[Topic] web search enrichment unavailable; "
+            "personalized and hot-list pools still generate: %s",
             exc,
         )
-        return (
-            topic_prepare_service,
-            None,
-            topic_outcome_queue,
-        )
+        search_provider_id = UNCONFIGURED_SEARCH_PROVIDER_ID
 
     # Bounds the cross-thread wait for one RID pair, so a stalled loop cannot wedge collection.
     summary_pair_match_timeout_seconds = 60.0
@@ -249,42 +259,6 @@ def _build_topic_starter_services(
     )
 
 
-def _seed_topic_starter_services(
-    topic_prepare_service: Any,
-    topic_service: Any | None,
-    run_id: str,
-) -> None:
-    if topic_service is not None:
-        topic_service.schedule_seed(run_id)
-
-
-async def _topic_starter_seed_loop(seed: Callable[[str], None]) -> None:
-    """Refresh topic pools on this process, without entering the cron job queue.
-
-    The first wake is shortly after AgentServer starts. Later wakes are the next
-    local midnight. A disabled recommendation switch returns immediately inside
-    ``seed``.
-    """
-
-    from datetime import datetime, timedelta, timezone
-
-    started = False
-    while True:
-        if not started:
-            await asyncio.sleep(5.0)
-        else:
-            now = datetime.now(timezone.utc).astimezone()
-            next_midnight = (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0,
-            )
-            await asyncio.sleep(max(0.0, (next_midnight - now).total_seconds()))
-        started = True
-        try:
-            seed(f"topic-starter-v6:{int(time.time())}")
-        except Exception as exc:  # noqa: BLE001 - isolated scheduled wake
-            logger.warning("[Topic] starter seed wake failed: %s", exc)
-
-
 async def _shutdown_topic_starter_services(
     topic_prepare_service: Any,
     topic_service: Any | None,
@@ -306,7 +280,6 @@ class RecommendationHost:
         self.legacy_topic_service: Any = None
         self.legacy_tasks: set[asyncio.Task] = set()
         self._services_built = False
-        self._seed_task: asyncio.Task[None] | None = None
         self._active_request_ids: Callable[[], Iterable[str]] = _no_active_request_ids
         self._push: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
 
@@ -323,23 +296,42 @@ class RecommendationHost:
 
     def ensure_services(self) -> None:
         if self._services_built:
-            return
+            if self.topic_service is not None:
+                return
+            from jiuwenswarm.agents.harness.common.recommendation.topic_search import (
+                OpenJiuwenNativeSearchContractError,
+                selected_topic_search_provider_id,
+            )
+
+            try:
+                selected_topic_search_provider_id()
+            except OpenJiuwenNativeSearchContractError:
+                return
         from jiuwenswarm.agents.harness.common.recommendation.topic_starter import (
             TopicStarterStore,
         )
         from jiuwenswarm.common.schema.message import TOPIC_STARTERS_READY_EVENT
         from jiuwenswarm.common.utils import get_agent_workspace_dir
 
-        self.store = TopicStarterStore(get_agent_workspace_dir() / "recommendation.db")
+        if self.store is None:
+            self.store = TopicStarterStore(get_agent_workspace_dir() / "recommendation.db")
         prepare, service, queue = _build_topic_starter_services(
             self.store,
             active_request_ids_loader=lambda: self._active_request_ids(),
+            prepare_service=self.topic_prepare_service if self._services_built else None,
+            outcome_queue=self.topic_outcome_queue if self._services_built else None,
         )
         self.topic_prepare_service = prepare
         self.topic_service = service
         self.topic_outcome_queue = queue
         if service is not None:
-            def _on_prepared(context_scope: str, state: str, pool_written: bool) -> None:
+            def _on_prepared(
+                context_scope: str,
+                state: str,
+                pool_written: bool,
+                *,
+                work_mode: str = "work",
+            ) -> None:
                 try:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
@@ -348,6 +340,7 @@ class RecommendationHost:
                     TOPIC_STARTERS_READY_EVENT,
                     {
                         "context_scope": context_scope,
+                        "work_mode": work_mode,
                         "state": state,
                         "pool_written": pool_written,
                     },
@@ -357,27 +350,11 @@ class RecommendationHost:
         self._services_built = True
 
     async def start(self) -> None:
+        # Pools fill on enable / chat successor / click / manual retry — not on
+        # process boot or a midnight timer.
         self.ensure_services()
-        if self._seed_task is None:
-            self._seed_task = asyncio.create_task(
-                _topic_starter_seed_loop(
-                    lambda run_id: _seed_topic_starter_services(
-                        self.topic_prepare_service,
-                        self.topic_service,
-                        run_id,
-                    ),
-                )
-            )
 
     async def shutdown(self) -> None:
-        task = self._seed_task
-        self._seed_task = None
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
         pending = tuple(self.legacy_tasks)
         for item in pending:
             item.cancel()
@@ -396,6 +373,7 @@ class RecommendationHost:
         if service is None:
             return
         from jiuwenswarm.agents.harness.common.recommendation.topic_product import (
+            normalize_topic_work_mode,
             scope_for_project,
         )
         from jiuwenswarm.server.runtime.session.session_metadata import (
@@ -406,40 +384,28 @@ class RecommendationHost:
             session_id, cache_bust=True, enable_writeback=False,
         ) or {}
         project_id = metadata.get("project_id")
-        service.schedule_successor(
-            context_scope="global_new_chat",
-            project_id=None,
-            visit_id=request_id,
-        )
+        work_mode = normalize_topic_work_mode(metadata.get("work_mode"))
+        # Global welcome only follows non-project chats; a project welcome only
+        # follows that project's chats. Never refresh both from one turn.
         if project_id not in (None, "", "default", "default_code"):
             service.schedule_successor(
                 context_scope=scope_for_project(str(project_id)),
                 project_id=project_id,
+                work_mode=work_mode,
                 visit_id=request_id,
             )
+            return
+        service.schedule_successor(
+            context_scope="global_new_chat",
+            project_id=None,
+            work_mode=work_mode,
+            visit_id=request_id,
+        )
 
     async def session_left_project(self, project_id: str, session_id: str) -> None:
-        if not project_id or project_id in {"default", "default_code"}:
-            return
-        self.ensure_services()
-        service = self.topic_service
-        if service is None or not service.configuration_status()["enabled"]:
-            return
-        from jiuwenswarm.agents.harness.common.recommendation.topic_product import (
-            scope_for_project,
-        )
-        from jiuwenswarm.common.schema.message import TOPIC_STARTERS_READY_EVENT
+        """No-op: leaving a project must not auto-refresh topic pools."""
 
-        context_scope = scope_for_project(project_id)
-        await self.emit(
-            TOPIC_STARTERS_READY_EVENT,
-            {"context_scope": context_scope, "state": "ready"},
-        )
-        service.schedule_successor(
-            context_scope=context_scope,
-            project_id=project_id,
-            visit_id=f"session-left-project:{session_id}",
-        )
+        del project_id, session_id
 
     async def handle(
         self,
